@@ -148,16 +148,26 @@ def use_credit(uid):
 # =====================================
 
 
-# ================= FRAUD ===============
+# ================= NAKRUTKA (FIXED) ====
 def detect_like_fraud(views, likes, comments, hours):
-    if views == 0:
+    if views <= 0:
         return "⚪ Ma’lumot yetarli emas"
-    if likes / views > 0.25 and views > 1000:
-        return "🔴 LIKE NAKRUTKA EHTIMOLI"
-    if comments / views < 0.001 and views > 5000:
-        return "🟡 SHUBHALI FAOLLIGI"
-    if hours < 2 and views > 10000:
-        return "🟡 TEZ SUN’IY O‘SISH"
+
+    like_ratio = likes / views
+    comment_ratio = comments / views if views else 0
+
+    if likes > views:
+        return "🔴 LIKE NAKRUTKA (LIKELAR VIEWDAN KO‘P)"
+
+    if like_ratio >= 0.30:
+        return f"🔴 LIKE NAKRUTKA ({like_ratio*100:.0f}%)"
+
+    if like_ratio >= 0.20 and comment_ratio < 0.002:
+        return "🟠 SHUBHALI FAOLLIGI (LIKE BOR, COMMENT YO‘Q)"
+
+    if hours < 3 and views > 5000 and like_ratio > 0.15:
+        return "🟠 TEZ SUN’IY O‘SISH"
+
     return "🟢 NORMAL FAOLLIGI"
 # =====================================
 
@@ -184,6 +194,7 @@ async def start(m: Message):
     )
 
 
+# ================= ANALYZE =================
 @dp.message(F.text.regexp(YOUTUBE_REGEX))
 async def analyze(m: Message):
     uid = m.from_user.id
@@ -214,8 +225,12 @@ async def analyze(m: Message):
 
     dt = datetime.fromisoformat(sn["publishedAt"].replace("Z","+00:00"))
     hours = (datetime.now(timezone.utc) - dt).total_seconds()/3600
-    fraud = detect_like_fraud(int(st.get("viewCount",0)), int(st.get("likeCount",0)),
-                              int(st.get("commentCount",0)), hours)
+    fraud = detect_like_fraud(
+        int(st.get("viewCount",0)),
+        int(st.get("likeCount",0)),
+        int(st.get("commentCount",0)),
+        hours
+    )
 
     await m.answer(
         f"🎬 {sn['title']}\n"
@@ -245,9 +260,9 @@ async def tags(c: CallbackQuery):
         await c.message.answer("📝 DESCRIPTION:\n```\n"+part+"\n```", parse_mode="Markdown")
 
     await c.answer()
-# =====================================
 
 
+# ================= TOP 10 VIDEO =================
 @dp.callback_query(F.data.startswith("top:"))
 async def top_videos(c: CallbackQuery):
     vid = c.data.split(":")[1]
@@ -271,6 +286,7 @@ async def top_videos(c: CallbackQuery):
     await c.answer()
 
 
+# ================= TOP 5 KANAL =================
 @dp.callback_query(F.data.startswith("channels:"))
 async def channels(c: CallbackQuery):
     vid = c.data.split(":")[1]
@@ -293,7 +309,7 @@ async def channels(c: CallbackQuery):
 
 
 async def main():
-    print("🤖 BOT ISHLAYAPTI (MESSAGE LIMIT FIXED)")
+    print("🤖 BOT ISHLAYAPTI (NAKRUTKA FIXED, FINAL)")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
