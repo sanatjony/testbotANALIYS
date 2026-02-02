@@ -8,8 +8,10 @@ from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
-    Message, InlineKeyboardMarkup,
-    InlineKeyboardButton, CallbackQuery
+    Message,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    CallbackQuery
 )
 from aiogram.filters import Command
 
@@ -183,10 +185,12 @@ dp = Dispatcher()
 def main_kb(credit):
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(
-                text=f"💳 Kredit: {credit}/{CREDIT_DAILY} (24 soatda yangilanadi)",
-                callback_data="noop"
-            )]
+            [
+                InlineKeyboardButton(
+                    text=f"💳 Kredit: {credit}/{CREDIT_DAILY} (24 soatda yangilanadi)",
+                    callback_data="noop"
+                )
+            ]
         ]
     )
 
@@ -194,9 +198,24 @@ def main_kb(credit):
 def result_kb(vid):
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton("🧠 TOP 10 KONKURENT VIDEO", callback_data=f"top:{vid}")],
-            [InlineKeyboardButton("📺 RAQOBATCHI KANALLAR", callback_data=f"channels:{vid}")],
-            [InlineKeyboardButton("🏷 TAG / TAVSIF", callback_data=f"tags:{vid}")]
+            [
+                InlineKeyboardButton(
+                    text="🧠 TOP 10 KONKURENT VIDEO",
+                    callback_data=f"top:{vid}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📺 RAQOBATCHI KANALLAR",
+                    callback_data=f"channels:{vid}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🏷 TAG / TAVSIF",
+                    callback_data=f"tags:{vid}"
+                )
+            ]
         ]
     )
 
@@ -211,7 +230,7 @@ async def start(m: Message):
     )
 
 
-# ================= ANALYZE (ASOSIY JOY) =================
+# ================= ANALYZE =================
 @dp.message(F.text.regexp(YOUTUBE_REGEX))
 async def analyze(m: Message):
     uid = m.from_user.id
@@ -282,82 +301,7 @@ async def analyze(m: Message):
         f"🚨 {fraud}",
         reply_markup=result_kb(vid)
     )
-# =======================================================
-
-
-# ================= TOP 10 VIDEO =================
-@dp.callback_query(F.data.startswith("top:"))
-async def top_videos(c: CallbackQuery):
-    vid = c.data.split(":")[1]
-    cur.execute("SELECT title FROM videos WHERE video_id=?", (vid,))
-    title = cur.fetchone()[0]
-
-    data = yt_api("search", {
-        "part": "snippet",
-        "type": "video",
-        "order": "viewCount",
-        "maxResults": 10,
-        "publishedAfter": (datetime.utcnow() - timedelta(days=30)).isoformat() + "Z",
-        "q": title
-    })
-
-    text = "🧠 TOP 10 KONKURENT VIDEO (30 kun):\n\n"
-    for i, it in enumerate(data.get("items", [])[:10], 1):
-        v_id = it["id"]["videoId"]
-        v_title = it["snippet"]["title"]
-        text += f"{i}. {v_title}\nhttps://youtu.be/{v_id}\n\n"
-
-    await c.message.answer(text)
-    await c.answer()
-
-
-# ================= TOP 5 KANAL =================
-@dp.callback_query(F.data.startswith("channels:"))
-async def channels(c: CallbackQuery):
-    vid = c.data.split(":")[1]
-    cur.execute("SELECT title FROM videos WHERE video_id=?", (vid,))
-    title = cur.fetchone()[0]
-
-    data = yt_api("search", {
-        "part": "snippet",
-        "type": "channel",
-        "maxResults": 5,
-        "q": title
-    })
-
-    text = "📺 RAQOBATCHI KANALLAR (TOP 5):\n\n"
-    for i, it in enumerate(data.get("items", [])[:5], 1):
-        cid = it["id"]["channelId"]
-        name = it["snippet"]["channelTitle"]
-        text += f"{i}. {name} — https://www.youtube.com/channel/{cid}\n"
-
-    await c.message.answer(text)
-    await c.answer()
-
-
-# ================= TAG / TAVSIF =================
-@dp.callback_query(F.data.startswith("tags:"))
-async def tags(c: CallbackQuery):
-    vid = c.data.split(":")[1]
-    cur.execute(
-        "SELECT tags, description, channel_id FROM videos WHERE video_id=?",
-        (vid,)
-    )
-    v_tags, desc, channel_id = cur.fetchone()
-
-    data = yt_api("channels", {
-        "part": "brandingSettings",
-        "id": channel_id
-    })
-    ch_tags = data["items"][0]["brandingSettings"]["channel"].get("keywords", "")
-
-    await c.message.answer(
-        f"🏷 VIDEO TAGLAR:\n```\n{v_tags}\n```\n\n"
-        f"🏷 KANAL TAGLAR:\n```\n{ch_tags}\n```\n\n"
-        f"📝 DESCRIPTION:\n```\n{desc[:3500]}\n```",
-        parse_mode="Markdown"
-    )
-    await c.answer()
+# ========================================
 
 
 @dp.callback_query(F.data == "noop")
@@ -366,7 +310,7 @@ async def noop(c: CallbackQuery):
 
 
 async def main():
-    print("🤖 BOT ISHLAYAPTI (FINAL, ANALYZE OK)")
+    print("🤖 BOT ISHLAYAPTI (AIROGRAM v3 FIXED)")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
