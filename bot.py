@@ -11,15 +11,18 @@ from aiogram.client.default import DefaultBotProperties
 # ================= CONFIG =================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_KEYS = [k.strip() for k in os.getenv("YOUTUBE_API_KEYS","").split(",") if k.strip()]
+ADMIN_ID = int(os.getenv("ADMIN_ID","0"))
 
 TZ_TASHKENT = timezone(timedelta(hours=5))
+DAILY_CREDITS = 5
 
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
-# ================= DB + RAM CACHE =================
-db = sqlite3.connect("cache.db", check_same_thread=False)
+# ================= DB =================
+db = sqlite3.connect("bot.db", check_same_thread=False)
 cur = db.cursor()
+
 cur.execute("""
 CREATE TABLE IF NOT EXISTS cache (
     key TEXT PRIMARY KEY,
@@ -27,11 +30,31 @@ CREATE TABLE IF NOT EXISTS cache (
     ts INTEGER
 )
 """)
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS users (
+    user_id INTEGER PRIMARY KEY,
+    username TEXT,
+    credits INTEGER,
+    reset_ts INTEGER
+)
+""")
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS requests (
+    user_id INTEGER,
+    username TEXT,
+    link TEXT,
+    ts INTEGER
+)
+""")
+
 db.commit()
 
 RAM = {}
-CACHE_TTL = 3600  # 1 soat
+CACHE_TTL = 3600
 
+# ================= HELPERS =================
 def cache_get(key):
     if key in RAM:
         return RAM[key]
@@ -45,16 +68,72 @@ def cache_get(key):
 
 def cache_set(key, data):
     RAM[key] = data
-    cur.execute("REPLACE INTO cache VALUES (?,?,?)", (key, json.dumps(data), int(time.time())))
+    cur.execute(
+        "REPLACE INTO cache VALUES (?,?,?)",
+        (key, json.dumps(data), int(time.time()))
+    )
     db.commit()
 
-# ================= YT HELPERS =================
+def next_reset_ts():
+    # Google API reset ≈ 00:00 PT → ~18:00 Toshkent
+    now = datetime.now(TZ_TASHKENT)
+    reset = now.replace(hour=18, minute=0, second=0, microsecond=0)
+    if now >= reset:
+        reset += timedelta(days=1)
+    return int(reset.timestamp())
+
+def get_user(user):
+    if user.id == ADMIN_ID:
+        return None  # admin cheklanmaydi
+
+    cur.execute("SELECT credits, reset_ts FROM users WHERE user_id=?", (user.id,))
+    row = cur.fetchone()
+
+    if not row:
+        cur.execute(
+            "INSERT INTO users VALUES (?,?,?,?)",
+            (user.id, user.username, DAILY_CREDITS, next_reset_ts())
+        )
+        db.commit()
+        return DAILY_CREDITS
+
+    credits, reset_ts = row
+    if time.time() >= reset_ts:
+        credits = DAILY_CREDITS
+        reset_ts = next_reset_ts()
+        cur.execute(
+            "UPDATE users SET credits=?, reset_ts=? WHERE user_id=?",
+            (credits, reset_ts, user.id)
+        )
+        db.commit()
+
+    return credits
+
+def use_credit(user):
+    if user.id == ADMIN_ID:
+        return True
+
+    credits = get_user(user)
+    if credits <= 0:
+        return False
+
+    cur.execute(
+        "UPDATE users SET credits=credits-1 WHERE user_id=?",
+        (user.id,)
+    )
+    db.commit()
+    return True
+
+# ================= YT =================
 def yt(endpoint, params):
     for k in API_KEYS:
         try:
             params["key"] = k
-            r = requests.get(f"https://www.googleapis.com/youtube/v3/{endpoint}",
-                             params=params, timeout=10)
+            r = requests.get(
+                f"https://www.googleapis.com/youtube/v3/{endpoint}",
+                params=params,
+                timeout=10
+            )
             if r.status_code == 200:
                 return r.json()
         except:
@@ -64,108 +143,6 @@ def yt(endpoint, params):
 def extract_video_id(url):
     m = re.search(r"(v=|be/)([\w\-]{11})", url)
     return m.group(2) if m else None
-
-def tashkent_time(iso):
-    dt = datetime.fromisoformat(iso.replace("Z","+00:00"))
-    return dt.astimezone(TZ_TASHKENT).strftime("%d.%m.%Y %H:%M")
-
-def like_nakrutka(views, likes):
-    if views == 0:
-        return "⚪ Maʼlumot yetarli emas"
-    r = likes / views
-    if r > 0.3:
-        return "🔴 Nakrutka ehtimoli yuqori"
-    if r > 0.15:
-        return "🟡 Shubhali"
-    return "🟢 Normal"
-
-# ================= CATEGORY AUTO =================
-CATEGORY_TRANSLATE = {
-    "Film & Animation": ("Film & Animation","Фильмы и анимация","Film va animatsiya"),
-    "Autos & Vehicles": ("Autos & Vehicles","Авто и транспорт","Avto va transport"),
-    "Music": ("Music","Музыка","Musiqa"),
-    "Pets & Animals": ("Pets & Animals","Животные","Hayvonlar"),
-    "Sports": ("Sports","Спорт","Sport"),
-    "Travel & Events": ("Travel & Events","Путешествия","Sayohat"),
-    "Gaming": ("Gaming","Игры","O‘yinlar"),
-    "People & Blogs": ("People & Blogs","Люди и блоги","Bloglar"),
-    "Comedy": ("Comedy","Юмор","Qiziqarli"),
-    "Entertainment": ("Entertainment","Развлечения","Ko‘ngilochar"),
-    "News & Politics": ("News & Politics","Новости","Yangiliklar"),
-    "Howto & Style": ("Howto & Style","Стиль","Qanday qilish"),
-    "Education": ("Education","Образование","Ta’lim"),
-    "Science & Technology": ("Science & Technology","Наука","Fan va texnologiya"),
-    "Nonprofits & Activism": ("Nonprofits & Activism","НКО","Ijtimoiy")
-}
-
-def load_categories():
-    cached = cache_get("categories")
-    if cached:
-        return cached
-    js = yt("videoCategories", {"part":"snippet","regionCode":"US"})
-    cats = {}
-    for it in js["items"]:
-        title = it["snippet"]["title"]
-        cats[it["id"]] = CATEGORY_TRANSLATE.get(title,(title,title,title))
-    cache_set("categories", cats)
-    return cats
-
-# ================= VIDEO =================
-def get_video(video_id):
-    key = f"video:{video_id}"
-    cached = cache_get(key)
-    if cached:
-        return cached
-
-    js = yt("videos", {"part":"snippet,statistics","id":video_id})
-    it = js["items"][0]
-    cats = load_categories()
-
-    cat_id = it["snippet"].get("categoryId")
-    cat = cats.get(cat_id,("—","—","—"))
-
-    data = {
-        "id": video_id,
-        "title": it["snippet"]["title"],
-        "desc": it["snippet"].get("description",""),
-        "thumb": it["snippet"]["thumbnails"]["high"]["url"],
-        "published": tashkent_time(it["snippet"]["publishedAt"]),
-        "views": int(it["statistics"].get("viewCount",0)),
-        "likes": int(it["statistics"].get("likeCount",0)),
-        "comments": int(it["statistics"].get("commentCount",0)),
-        "channel": it["snippet"]["channelTitle"],
-        "category": cat
-    }
-    cache_set(key, data)
-    return data
-
-# ================= SEARCH TOP 10 =================
-def search_top_videos(query, days=30, limit=10):
-    key = f"search:{query}:{days}"
-    cached = cache_get(key)
-    if cached:
-        return cached[:limit]
-
-    after = (datetime.utcnow()-timedelta(days=days)).isoformat()+"Z"
-    js = yt("search", {
-        "part":"snippet","q":query,"type":"video",
-        "order":"viewCount","maxResults":limit,
-        "publishedAfter":after
-    })
-    ids = [i["id"]["videoId"] for i in js["items"]]
-    if not ids:
-        return []
-
-    stats = yt("videos", {"part":"statistics,snippet","id":",".join(ids)})
-    out = []
-    for v in stats["items"]:
-        out.append({
-            "title": v["snippet"]["title"],
-            "views": int(v["statistics"].get("viewCount",0)),
-            "url": f"https://youtu.be/{v['id']}"
-        })
-    cache_set(key, out)
-    return out
 
 # ================= BOT =================
 @dp.message(CommandStart())
@@ -178,87 +155,51 @@ async def handle(m: Message):
     if not vid:
         return
 
-    msg = await m.answer("⏳ Analiz qilinmoqda...")
-    data = await asyncio.to_thread(get_video, vid)
-
-    nak = like_nakrutka(data["views"], data["likes"])
-    cat = data["category"]
-
-    text = (
-        f"🎬 <b>{data['title']}</b>\n\n"
-        f"🕒 Yuklangan: {data['published']} (Toshkent vaqti)\n"
-        f"📺 Kanal: {data['channel']}\n"
-        f"📂 Kategoriya:\n🇬🇧 {cat[0]} / 🇷🇺 {cat[1]} / 🇺🇿 {cat[2]}\n\n"
-        f"👁 {data['views']}   👍 {data['likes']}   💬 {data['comments']}\n"
-        f"⚠️ Likelar soni {nak}"
-    )
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🧠 TOP KONKURENT NOMLAR", callback_data=f"title:{vid}")],
-        [InlineKeyboardButton(text="🏷 TAG / TAVSIF", callback_data=f"tags:{vid}")],
-        [InlineKeyboardButton(text="📺 RAQOBATCHI KANALLAR", callback_data=f"comp:{vid}")]
-    ])
-
-    await msg.edit_text(text, reply_markup=kb)
-
-# ================= CALLBACKS =================
-@dp.callback_query(F.data.startswith("title:"))
-async def cb_titles(c: CallbackQuery):
-    vid = c.data.split(":")[1]
-    data = get_video(vid)
-    res = await asyncio.to_thread(search_top_videos, data["title"], 30, 10)
-
-    lines = [
-        f"{i+1}. {r['title']}\n👁 {r['views']:,}\n🔗 {r['url']}"
-        for i, r in enumerate(res)
-    ]
-    await c.message.answer("<b>🧠 TOP KONKURENT NOMLAR (30 kun)</b>\n\n" + "\n\n".join(lines))
-
-@dp.callback_query(F.data.startswith("tags:"))
-async def cb_tags(c: CallbackQuery):
-    vid = c.data.split(":")[1]
-    d = get_video(vid)
-    words = list(dict.fromkeys(re.findall(r"\w+", d["title"].lower())))
-    await c.message.answer(
-        "<b>🏷 Video taglari</b>\n<pre>" + ", ".join(words[:25]) + "</pre>\n\n"
-        "<b>🏷 Kanal taglari</b>\n<pre>" + ", ".join(words[:15]) + "</pre>\n\n"
-        "<b>📝 Description</b>\n<pre>" + d["desc"][:800] + "</pre>"
-    )
-
-@dp.callback_query(F.data.startswith("comp:"))
-async def cb_comp(c: CallbackQuery):
-    vid = c.data.split(":")[1]
-    data = get_video(vid)
-
-    cache_key = f"competitors:{vid}"
-    cached = cache_get(cache_key)
-    if cached:
-        await c.message.answer(cached)
+    if not use_credit(m.from_user):
+        await m.answer("❌ Bugungi kredit tugadi. Ertaga qayta urinib ko‘ring.")
         return
 
-    js = yt("search", {
-        "part":"snippet","q":data["title"],
-        "type":"video","maxResults":20
-    })
+    cur.execute(
+        "INSERT INTO requests VALUES (?,?,?,?)",
+        (m.from_user.id, m.from_user.username, m.text, int(time.time()))
+    )
+    db.commit()
 
-    channel_ids = []
-    for i in js["items"]:
-        cid = i["snippet"]["channelId"]
-        if cid not in channel_ids:
-            channel_ids.append(cid)
-        if len(channel_ids) == 10:
-            break
+    credits_left = get_user(m.from_user)
 
-    ch_js = yt("channels", {"part":"snippet","id":",".join(channel_ids)})
-    lines = []
-    for i, ch in enumerate(ch_js["items"],1):
-        name = ch["snippet"]["title"]
-        cid = ch["id"]
-        lines.append(f"{i}. {name}\n🔗 https://www.youtube.com/channel/{cid}")
+    msg = await m.answer("⏳ Analiz qilinmoqda...")
 
-    text = "<b>📺 RAQOBATCHI KANALLAR (TOP)</b>\n\n" + "\n\n".join(lines)
-    cache_set(cache_key, text)
-    await c.message.answer(text)
+    js = yt("videos", {"part":"snippet,statistics","id":vid})
+    it = js["items"][0]
+
+    text = (
+        f"🎬 <b>{it['snippet']['title']}</b>\n\n"
+        f"📺 Kanal: {it['snippet']['channelTitle']}\n"
+        f"👁 {it['statistics'].get('viewCount','0')}   "
+        f"👍 {it['statistics'].get('likeCount','0')}   "
+        f"💬 {it['statistics'].get('commentCount','0')}\n\n"
+        f"🎟 Kredit: {credits_left}/{DAILY_CREDITS}"
+    )
+
+    await msg.edit_text(text)
+
+# ================= ADMIN EXPORT =================
+@dp.message(F.text == "/export")
+async def export(m: Message):
+    if m.from_user.id != ADMIN_ID:
+        return
+
+    cur.execute("SELECT * FROM requests")
+    rows = cur.fetchall()
+
+    txt = ""
+    for r in rows:
+        txt += f"{r[0]} | @{r[1]} | {r[2]} | {datetime.fromtimestamp(r[3])}\n"
+
+    with open("export.txt","w",encoding="utf-8") as f:
+        f.write(txt)
+
+    await m.answer_document(open("export.txt","rb"))
 
 # ================= RUN =================
 async def main():
