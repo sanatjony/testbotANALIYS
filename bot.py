@@ -90,9 +90,16 @@ def extract_video_id(url):
 
 def yt_api(endpoint, params):
     params["key"] = YOUTUBE_API_KEY
-    r = requests.get(f"https://www.googleapis.com/youtube/v3/{endpoint}", params=params, timeout=20)
+    r = requests.get(
+        f"https://www.googleapis.com/youtube/v3/{endpoint}",
+        params=params,
+        timeout=20
+    )
     r.raise_for_status()
     return r.json()
+
+def split_text(text, limit=4000):
+    return [text[i:i+limit] for i in range(0, len(text), limit)]
 # =====================================
 
 
@@ -221,7 +228,26 @@ async def analyze(m: Message):
     )
 
 
-# ================= CALLBACKLAR =================
+# ================= TAG / TAVSIF =================
+@dp.callback_query(F.data.startswith("tags:"))
+async def tags(c: CallbackQuery):
+    vid = c.data.split(":")[1]
+    cur.execute("SELECT tags,description,channel_id FROM videos WHERE video_id=?", (vid,))
+    vtags, desc, cid = cur.fetchone()
+
+    data = yt_api("channels", {"part":"brandingSettings","id":cid})
+    ctags = data["items"][0]["brandingSettings"]["channel"].get("keywords","")
+
+    await c.message.answer("🏷 VIDEO TAGLAR:\n```\n"+vtags+"\n```", parse_mode="Markdown")
+    await c.message.answer("🏷 KANAL TAGLAR:\n```\n"+ctags+"\n```", parse_mode="Markdown")
+
+    for part in split_text(desc):
+        await c.message.answer("📝 DESCRIPTION:\n```\n"+part+"\n```", parse_mode="Markdown")
+
+    await c.answer()
+# =====================================
+
+
 @dp.callback_query(F.data.startswith("top:"))
 async def top_videos(c: CallbackQuery):
     vid = c.data.split(":")[1]
@@ -266,27 +292,8 @@ async def channels(c: CallbackQuery):
     await c.answer()
 
 
-@dp.callback_query(F.data.startswith("tags:"))
-async def tags(c: CallbackQuery):
-    vid = c.data.split(":")[1]
-    cur.execute("SELECT tags,description,channel_id FROM videos WHERE video_id=?", (vid,))
-    vtags, desc, cid = cur.fetchone()
-
-    data = yt_api("channels", {"part":"brandingSettings","id":cid})
-    ctags = data["items"][0]["brandingSettings"]["channel"].get("keywords","")
-
-    await c.message.answer(
-        f"🏷 VIDEO TAGLAR:\n```\n{vtags}\n```\n\n"
-        f"🏷 KANAL TAGLAR:\n```\n{ctags}\n```\n\n"
-        f"📝 DESCRIPTION:\n```\n{desc[:3500]}\n```",
-        parse_mode="Markdown"
-    )
-    await c.answer()
-# =====================================
-
-
 async def main():
-    print("🤖 BOT ISHLAYAPTI (INLINE CALLBACK OK)")
+    print("🤖 BOT ISHLAYAPTI (MESSAGE LIMIT FIXED)")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
