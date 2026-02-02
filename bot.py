@@ -1,14 +1,13 @@
 import os, re, asyncio, requests
-from datetime import datetime, timedelta
-from difflib import SequenceMatcher
+from datetime import datetime, timedelta, timezone
 from collections import Counter
+from difflib import SequenceMatcher
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 
-# ================= CONFIG =================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 
@@ -18,13 +17,13 @@ bot = Bot(
 )
 dp = Dispatcher()
 
-# ================= YOUTUBE HELPERS =================
+# ================= UTILS =================
 def yt(endpoint, params):
     params["key"] = YOUTUBE_API_KEY
     r = requests.get(
         f"https://www.googleapis.com/youtube/v3/{endpoint}",
         params=params,
-        timeout=20
+        timeout=15
     )
     r.raise_for_status()
     return r.json()
@@ -36,126 +35,33 @@ def extract_video_id(url):
             return m.group(1)
     return None
 
-def clean(text):
-    return re.sub(r"[^\w\s]", "", text).lower().strip()
+def clean(t): 
+    return re.sub(r"[^\w\s]", "", t.lower()).strip()
 
-def similarity(a, b):
-    return SequenceMatcher(None, a, b).ratio()
+def similar(a, b):
+    return SequenceMatcher(None, a, b).ratio() > 0.7
 
 def is_recent(date_str, days):
-    d = datetime.strptime(date_str, "%Y-%m-%dT%H:%M:%SZ")
-    return d >= datetime.utcnow() - timedelta(days=days)
+    d = datetime.strptime(date_str, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    return d >= datetime.now(timezone.utc) - timedelta(days=days)
 
-# ================= ANALYTICS =================
-def get_video_basic(video_id):
-    data = yt("videos", {
-        "part": "snippet,statistics",
-        "id": video_id
-    })["items"]
-
-    if not data:
+# ================= CORE =================
+def get_video(video_id):
+    r = yt("videos", {"part": "snippet,statistics", "id": video_id})["items"]
+    if not r:
         return None
-
-    s = data[0]
+    v = r[0]
     return {
-        "title": s["snippet"]["title"],
-        "channel_id": s["snippet"]["channelId"],
-        "channel_title": s["snippet"]["channelTitle"],
-        "views": int(s["statistics"].get("viewCount", 0)),
-        "likes": int(s["statistics"].get("likeCount", 0)),
-        "comments": int(s["statistics"].get("commentCount", 0)),
+        "title": v["snippet"]["title"],
+        "views": int(v["statistics"].get("viewCount", 0)),
+        "likes": int(v["statistics"].get("likeCount", 0)),
+        "comments": int(v["statistics"].get("commentCount", 0)),
     }
 
-# ================= TOP COMPETITOR TITLES =================
-def competitor_top_titles(base_title):
+def competitor_titles(base_title):
     base = clean(base_title)
-    words = base.split()
-
-    queries = list(dict.fromkeys([
-        base,
-        " ".join(words[:5]),
-        " ".join(words[:4]),
-        " ".join(words[:3]),
-        f"{words[0]} gameplay",
-        f"{words[0]} truck",
-        f"{words[0]} mcqueen",
-        "beamng truck",
-        "flatbed truck"
-    ]))
-
-    results = []
-
-    for days in [60, 90]:
-        for q in queries:
-            search = yt("search", {
-                "part": "snippet",
-                "q": q,
-                "type": "video",
-                "order": "viewCount",
-                "maxResults": 50
-            })
-
-            for item in search.get("items", []):
-                vid = item["id"]["videoId"]
-                sn = item["snippet"]
-
-                if not is_recent(sn["publishedAt"], days):
-                    continue
-
-                v = yt("videos", {
-                    "part": "statistics,snippet",
-                    "id": vid
-                })["items"]
-
-                if not v:
-                    continue
-
-                views = int(v[0]["statistics"].get("viewCount", 0))
-                if views < 100:
-                    continue
-
-                title = v[0]["snippet"]["title"]
-                ct = clean(title)
-
-                if any(similarity(ct, clean(r["title"])) > 0.7 for r in results):
-                    continue
-
-                results.append({
-                    "title": title,
-                    "views": views,
-                    "channel": v[0]["snippet"]["channelTitle"]
-                })
-
-                if len(results) >= 10:
-                    return sorted(results, key=lambda x: x["views"], reverse=True)
-
-    return sorted(results, key=lambda x: x["views"], reverse=True)
-
-# ================= TAG GENERATOR =================
-def generate_tags(title, competitors):
-    words = []
-    for t in [title] + [c["title"] for c in competitors]:
-        words += clean(t).split()
-
-    common = Counter(words).most_common(25)
-
-    tags = []
-    for w, _ in common:
-        if len(w) > 3 and w not in tags:
-            tags.append(w)
-
-    # semantic extensions
-    extra = ["gameplay", "challenge", "experiment", "truck", "cars", "viral", "satisfying"]
-    for e in extra:
-        if e not in tags:
-            tags.append(e)
-
-    return ", ".join(tags[:30])
-
-# ================= COMPETITOR CHANNELS =================
-def competitor_channels(base_title):
-    base = clean(base_title)
-    channels = {}
+    seen = []
+    out = []
 
     search = yt("search", {
         "part": "snippet",
@@ -165,26 +71,66 @@ def competitor_channels(base_title):
         "maxResults": 50
     })
 
-    for item in search.get("items", []):
-        cid = item["snippet"]["channelId"]
-        cname = item["snippet"]["channelTitle"]
-        channels[cid] = cname
+    for it in search["items"]:
+        if not is_recent(it["snippet"]["publishedAt"], 90):
+            continue
 
-    results = []
-    for cid, cname in channels.items():
-        ch_vids = yt("search", {
-            "part": "id",
-            "channelId": cid,
-            "type": "video",
-            "maxResults": 10
-        })["items"]
+        vid = it["id"]["videoId"]
+        v = yt("videos", {"part": "statistics,snippet", "id": vid})["items"]
+        if not v:
+            continue
 
-        results.append({
-            "channel": cname,
-            "count": len(ch_vids)
-        })
+        title = v[0]["snippet"]["title"]
+        views = int(v[0]["statistics"].get("viewCount", 0))
+        if views < 1000:
+            continue
 
-    return sorted(results, key=lambda x: x["count"], reverse=True)[:5]
+        ct = clean(title)
+        if any(similar(ct, s) for s in seen):
+            continue
+
+        seen.append(ct)
+        out.append((title, views))
+        if len(out) >= 10:
+            break
+
+    return out
+
+def make_tags(title, competitors):
+    words = []
+    for t, _ in competitors:
+        words += clean(t).split()
+    words += clean(title).split()
+
+    common = Counter(words).most_common(30)
+    tags = [w for w, _ in common if len(w) > 3]
+
+    base = ["gameplay", "challenge", "experiment", "truck", "cars", "viral"]
+    for b in base:
+        if b not in tags:
+            tags.append(b)
+
+    return ", ".join(tags[:30])
+
+def competitor_channels(base_title):
+    base = clean(base_title)
+    chans = {}
+
+    s = yt("search", {
+        "part": "snippet",
+        "q": base,
+        "type": "video",
+        "order": "viewCount",
+        "maxResults": 25
+    })
+
+    for it in s["items"]:
+        cid = it["snippet"]["channelId"]
+        cname = it["snippet"]["channelTitle"]
+        chans.setdefault(cname, 0)
+        chans[cname] += 1
+
+    return sorted(chans.items(), key=lambda x: x[1], reverse=True)[:5]
 
 # ================= HANDLERS =================
 @dp.message(F.text == "/start")
@@ -192,103 +138,71 @@ async def start(msg: Message):
     await msg.answer(
         "👋 <b>Salom!</b>\n\n"
         "YouTube video linkini yuboring.\n\n"
-        "Men sizga:\n"
-        "🧠 TOP nomlar (konkurentlardan)\n"
+        "🧠 TOP nomlar\n"
         "🏷 TOP taglar\n"
-        "📺 Raqobatchi kanallar\n"
-        "chiqarib beraman."
+        "📺 Raqobatchi kanallar"
     )
 
 @dp.message(F.text.startswith("http"))
-async def handle_video(msg: Message):
+async def handle(msg: Message):
     vid = extract_video_id(msg.text)
     if not vid:
-        await msg.answer("❌ Link noto‘g‘ri.")
-        return
+        return await msg.answer("❌ Link noto‘g‘ri.")
 
-    data = get_video_basic(vid)
+    data = await asyncio.to_thread(get_video, vid)
     if not data:
-        await msg.answer("❌ Video topilmadi.")
-        return
+        return await msg.answer("❌ Video topilmadi.")
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="🧠 TOP NOMLAR", callback_data=f"titles:{vid}"),
-            InlineKeyboardButton(text="🏷 TOP TAGLAR", callback_data=f"tags:{vid}")
+            InlineKeyboardButton(text="🧠 TOP NOMLAR", callback_data=f"t:{vid}"),
+            InlineKeyboardButton(text="🏷 TOP TAGLAR", callback_data=f"g:{vid}")
         ],
         [
-            InlineKeyboardButton(text="📺 Raqobatchi kanallar", callback_data=f"channels:{vid}")
+            InlineKeyboardButton(text="📺 Raqobatchi kanallar", callback_data=f"c:{vid}")
         ]
     ])
 
     await msg.answer(
-        f"🎬 <b>{data['title']}</b>\n\n"
+        f"🎬 <b>{data['title']}</b>\n"
         f"👁 {data['views']:,} | 👍 {data['likes']:,} | 💬 {data['comments']:,}\n\n"
-        "👇 Kerakli funksiyani tanlang:",
+        "👇 Funksiyani tanlang:",
         reply_markup=kb
     )
 
-# -------- TOP TITLES
-@dp.callback_query(F.data.startswith("titles:"))
-async def cb_titles(cb: CallbackQuery):
-    vid = cb.data.split(":")[1]
-    wait = await cb.message.answer("⏳ Konkurent nomlar analiz qilinmoqda...")
+@dp.callback_query()
+async def callbacks(cb: CallbackQuery):
+    action, vid = cb.data.split(":")
+    wait = await cb.message.answer("⏳ Analiz qilinmoqda...")
 
-    base = get_video_basic(vid)["title"]
-    tops = competitor_top_titles(base)
+    try:
+        base = (await asyncio.to_thread(get_video, vid))["title"]
 
-    await wait.delete()
+        if action == "t":
+            res = await asyncio.to_thread(competitor_titles, base)
+            text = "🧠 <b>TOP KONKURENT NOMLAR:</b>\n\n"
+            for i, (t, v) in enumerate(res, 1):
+                text += f"{i}. {t}\n👁 {v:,}\n\n"
+            await cb.message.answer(text)
 
-    if not tops:
-        await cb.message.answer("⚠️ Yetarli ma’lumot topilmadi.")
-        return
+        elif action == "g":
+            comps = await asyncio.to_thread(competitor_titles, base)
+            tags = await asyncio.to_thread(make_tags, base, comps)
+            await cb.message.answer(f"🏷 <b>TOP TAGLAR:</b>\n\n<code>{tags}</code>")
 
-    text = "🧠 <b>OXIRGI 60–90 KUN — TOP KONKURENT NOMLAR:</b>\n\n"
-    for i, t in enumerate(tops, 1):
-        text += f"{i}. {t['title']}\n   👁 {t['views']:,}\n\n"
+        elif action == "c":
+            chans = await asyncio.to_thread(competitor_channels, base)
+            text = "📺 <b>RAQOBATCHI KANALLAR:</b>\n\n"
+            for i, (c, n) in enumerate(chans, 1):
+                text += f"{i}. {c} — {n} video\n"
+            await cb.message.answer(text)
 
-    await cb.message.answer(text)
-    await cb.answer()
+    except Exception as e:
+        await cb.message.answer(f"⚠️ Xatolik: {e}")
 
-# -------- TAGS
-@dp.callback_query(F.data.startswith("tags:"))
-async def cb_tags(cb: CallbackQuery):
-    vid = cb.data.split(":")[1]
-    wait = await cb.message.answer("⏳ TOP taglar tayyorlanmoqda...")
-
-    base = get_video_basic(vid)["title"]
-    competitors = competitor_top_titles(base)
-    tags = generate_tags(base, competitors)
-
-    await wait.delete()
-
-    await cb.message.answer(
-        "🏷 <b>TOP TAGLAR (copy-paste):</b>\n\n"
-        f"<code>{tags}</code>"
-    )
-    await cb.answer()
-
-# -------- CHANNELS
-@dp.callback_query(F.data.startswith("channels:"))
-async def cb_channels(cb: CallbackQuery):
-    vid = cb.data.split(":")[1]
-    wait = await cb.message.answer("⏳ Raqobatchi kanallar analiz qilinmoqda...")
-
-    base = get_video_basic(vid)["title"]
-    chans = competitor_channels(base)
-
-    await wait.delete()
-
-    if not chans:
-        await cb.message.answer("⚠️ Kanal ma’lumotlari topilmadi.")
-        return
-
-    text = "📺 <b>RAQOBATCHI KANALLAR (TOP):</b>\n\n"
-    for i, c in enumerate(chans, 1):
-        text += f"{i}. {c['channel']}\n   🎞 O‘xshash video: {c['count']}\n\n"
-
-    await cb.message.answer(text)
-    await cb.answer()
+    finally:
+        await wait.delete()
+        await cb.answer()
 
 # ================= RUN =================
 async def main():
