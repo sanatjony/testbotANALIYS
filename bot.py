@@ -22,7 +22,7 @@ dp = Dispatcher()
 
 # ================== UTILS ==================
 
-def extract_video_id(url: str):
+def extract_video_id(url: str) -> str | None:
     patterns = [
         r"v=([a-zA-Z0-9_-]{11})",
         r"youtu\.be/([a-zA-Z0-9_-]{11})",
@@ -42,23 +42,35 @@ def clean_text(text: str):
 
 
 def build_phrases(words, n):
-    return [" ".join(words[i:i+n]) for i in range(len(words) - n + 1)]
+    return [
+        " ".join(words[i:i+n])
+        for i in range(len(words) - n + 1)
+    ]
 
 
-# ================== YOUTUBE ==================
+# ================== YOUTUBE API ==================
 
-def yt_video(video_id):
+def yt_video(video_id: str):
     url = "https://www.googleapis.com/youtube/v3/videos"
     params = {
         "key": YT_API_KEY,
         "part": "snippet,statistics",
         "id": video_id
     }
-    r = requests.get(url, params=params).json()
-    return r["items"][0] if r.get("items") else None
+
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        data = r.json()
+    except Exception:
+        return None
+
+    if "items" not in data or not data["items"]:
+        return None
+
+    return data["items"][0]
 
 
-def yt_search(query, max_results=30):
+def yt_search(query: str, max_results=30):
     url = "https://www.googleapis.com/youtube/v3/search"
     params = {
         "key": YT_API_KEY,
@@ -67,40 +79,41 @@ def yt_search(query, max_results=30):
         "type": "video",
         "maxResults": max_results
     }
-    return requests.get(url, params=params).json().get("items", [])
+
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        return r.json().get("items", [])
+    except Exception:
+        return []
 
 
 # ================== AI CORE ==================
 
-def ai_semantic_tags(base_title):
-    results = yt_search(base_title)
+def ai_semantic_tags(base_title: str):
+    results = yt_search(base_title, 40)
     pool = []
 
     for v in results:
         pool += clean_text(v["snippet"]["title"])
         pool += clean_text(v["snippet"].get("description", ""))
 
-    phrases = (
-        build_phrases(pool, 2) +
-        build_phrases(pool, 3)
-    )
-
+    phrases = build_phrases(pool, 2) + build_phrases(pool, 3)
     counter = Counter(phrases)
-    tags = [p for p, c in counter.most_common(40)]
 
+    tags = [p for p, _ in counter.most_common(30)]
     return tags[:25]
 
 
-def ai_titles(base_title, tags):
+def ai_titles(base_title: str, tags: list[str]):
     base = base_title.split("|")[0].strip()
 
     hooks = [
         "INSANE",
         "You Won’t Believe",
-        "This Changed Everything",
         "Unexpected",
         "Extreme Test",
-        "People Are Shocked By"
+        "People Are Shocked By",
+        "This Changed Everything"
     ]
 
     titles = []
@@ -112,36 +125,49 @@ def ai_titles(base_title, tags):
     return titles
 
 
-def competitor_analysis(base_title):
+def competitor_analysis(base_title: str):
     results = yt_search(base_title, 40)
-    channels = defaultdict(list)
+    channels = defaultdict(int)
 
     for r in results:
-        ch = r["snippet"]["channelTitle"]
-        channels[ch].append(r["snippet"]["title"])
+        channels[r["snippet"]["channelTitle"]] += 1
 
-    ranked = sorted(channels.items(), key=lambda x: len(x[1]), reverse=True)
+    ranked = sorted(channels.items(), key=lambda x: x[1], reverse=True)
 
     text = "🧲 <b>Raqobatchi kanallar (TOP)</b>\n\n"
-    for i, (ch, vids) in enumerate(ranked[:5], 1):
-        text += f"{i}️⃣ <b>{ch}</b>\n📹 Videolar: {len(vids)}\n\n"
+    for i, (ch, count) in enumerate(ranked[:5], 1):
+        text += f"{i}️⃣ <b>{ch}</b>\n📹 O‘xshash videolar: {count}\n\n"
 
-    text += "📌 <i>Ko‘p video chiqargan kanallar — real raqobatchilar</i>"
+    text += "📌 <i>Ko‘p chiqayotgan kanallar — real raqobatchilar</i>"
     return text
 
 
 # ================== HANDLERS ==================
 
+@dp.message(F.text == "/start")
+async def start_cmd(message: Message):
+    await message.answer(
+        "👋 <b>Salom!</b>\n\n"
+        "🔗 YouTube video havolasini yuboring.\n\n"
+        "Men sizga:\n"
+        "• 🧠 AI Title\n"
+        "• 🏷 AI Tags\n"
+        "• 🧲 Raqobatchi analiz\n\n"
+        "chiqarib beraman."
+    )
+
+
 @dp.message(F.text.startswith("http"))
 async def handle_video(message: Message):
     vid = extract_video_id(message.text)
+
     if not vid:
-        await message.answer("❌ Video havolasi noto‘g‘ri.")
+        await message.answer("❌ YouTube video ID topilmadi.")
         return
 
     info = yt_video(vid)
     if not info:
-        await message.answer("❌ Video topilmadi.")
+        await message.answer("❌ Video topilmadi yoki API cheklangan.")
         return
 
     title = info["snippet"]["title"]
@@ -160,7 +186,7 @@ async def handle_video(message: Message):
     await message.answer(
         f"🎬 <b>Mavjud video nomi:</b>\n{title}\n\n"
         f"📺 <b>Kanal:</b> {channel}\n\n"
-        f"👇 Kerakli funksiyani tanlang",
+        "👇 Kerakli funksiyani tanlang",
         reply_markup=kb
     )
 
@@ -169,14 +195,19 @@ async def handle_video(message: Message):
 async def cb_tags(cb: CallbackQuery):
     vid = cb.data.split(":")[1]
     info = yt_video(vid)
+
+    if not info:
+        await cb.message.answer("❌ Taglar olishda xatolik.")
+        await cb.answer()
+        return
+
     tags = ai_semantic_tags(info["snippet"]["title"])
 
-    text = (
+    await cb.message.answer(
         "🏷 <b>AI tavsiya qilgan TOP TAGLAR</b>\n\n"
         "<code>" + ", ".join(tags) + "</code>\n\n"
         "📈 CTR + Search uchun mos"
     )
-    await cb.message.answer(text)
     await cb.answer()
 
 
@@ -184,6 +215,12 @@ async def cb_tags(cb: CallbackQuery):
 async def cb_titles(cb: CallbackQuery):
     vid = cb.data.split(":")[1]
     info = yt_video(vid)
+
+    if not info:
+        await cb.message.answer("❌ Title generatsiyada xatolik.")
+        await cb.answer()
+        return
+
     tags = ai_semantic_tags(info["snippet"]["title"])
     titles = ai_titles(info["snippet"]["title"], tags)
 
@@ -199,15 +236,22 @@ async def cb_titles(cb: CallbackQuery):
 async def cb_comp(cb: CallbackQuery):
     vid = cb.data.split(":")[1]
     info = yt_video(vid)
-    text = competitor_analysis(info["snippet"]["title"])
 
-    await cb.message.answer(text)
+    if not info:
+        await cb.message.answer("❌ Raqobatchi analizida xatolik.")
+        await cb.answer()
+        return
+
+    await cb.message.answer(
+        competitor_analysis(info["snippet"]["title"])
+    )
     await cb.answer()
 
 
 # ================== START ==================
 
 async def main():
+    print("🤖 Test bot ishga tushdi")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
