@@ -3,6 +3,7 @@ import re
 import sqlite3
 import time
 import os
+import csv
 import requests
 from datetime import datetime, timedelta, timezone
 
@@ -11,19 +12,22 @@ from aiogram.types import (
     Message,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
-    CallbackQuery
+    CallbackQuery,
+    FSInputFile
 )
 from aiogram.filters import Command
 
 # ================= ENV =================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEYS")
+ADMIN_IDS = os.getenv("ADMIN_IDS", "")
 
 if not BOT_TOKEN or not YOUTUBE_API_KEY:
     raise RuntimeError("BOT_TOKEN yoki YOUTUBE_API_KEYS yo‘q")
 
 BOT_TOKEN = BOT_TOKEN.strip()
 YOUTUBE_API_KEY = YOUTUBE_API_KEY.strip()
+ADMIN_IDS = {int(x) for x in ADMIN_IDS.split(",") if x.strip().isdigit()}
 # =====================================
 
 
@@ -63,12 +67,24 @@ cur.execute("""CREATE TABLE IF NOT EXISTS categories (
     name TEXT
 )""")
 
+cur.execute("""CREATE TABLE IF NOT EXISTS submissions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    username TEXT,
+    video_id TEXT,
+    video_url TEXT,
+    created_at INTEGER
+)""")
+
 conn.commit()
 # =====================================
 
 
 # ================= HELPERS =============
 YOUTUBE_REGEX = r"(https?://(?:www\.)?(?:youtube\.com|youtu\.be)/\S+)"
+
+def is_admin(uid: int) -> bool:
+    return uid in ADMIN_IDS
 
 def extract_video_id(url: str):
     for p in [r"v=([^&]+)", r"youtu\.be/([^?]+)", r"shorts/([^?]+)"]:
@@ -97,12 +113,10 @@ def preload_categories():
     cur.execute("SELECT COUNT(*) FROM categories")
     if cur.fetchone()[0] > 0:
         return
-
     data = yt_api("videoCategories", {
         "part": "snippet",
         "regionCode": "US"
     })
-
     for it in data.get("items", []):
         cur.execute(
             "INSERT OR IGNORE INTO categories VALUES (?,?)",
@@ -111,8 +125,6 @@ def preload_categories():
     conn.commit()
 
 def resolve_category(cat_id):
-    if not cat_id:
-        return "Unknown"
     cur.execute("SELECT name FROM categories WHERE category_id=?", (cat_id,))
     row = cur.fetchone()
     return row[0] if row else "Unknown"
@@ -121,6 +133,9 @@ def resolve_category(cat_id):
 
 # ================= CREDIT ==============
 def get_credit(uid):
+    if is_admin(uid):
+        return 999999
+
     now = int(time.time())
     cur.execute("SELECT credit, last_reset FROM users WHERE user_id=?", (uid,))
     row = cur.fetchone()
@@ -145,6 +160,8 @@ def get_credit(uid):
     return credit
 
 def use_credit(uid):
+    if is_admin(uid):
+        return
     cur.execute(
         "UPDATE users SET credit = credit - 1 WHERE user_id=? AND credit > 0",
         (uid,)
@@ -157,22 +174,16 @@ def use_credit(uid):
 def detect_like_fraud(views, likes, comments, hours):
     if views <= 0:
         return "⚪ Ma’lumot yetarli emas"
-
     like_ratio = likes / views
     comment_ratio = comments / views if views else 0
-
     if likes > views:
         return "🔴 LIKE NAKRUTKA (LIKELAR VIEWDAN KO‘P)"
-
     if like_ratio >= 0.30:
         return f"🔴 LIKE NAKRUTKA ({like_ratio*100:.0f}%)"
-
     if like_ratio >= 0.20 and comment_ratio < 0.002:
         return "🟠 SHUBHALI FAOLLIGI"
-
     if hours < 3 and views > 5000 and like_ratio > 0.15:
         return "🟠 TEZ SUN’IY O‘SISH"
-
     return "🟢 NORMAL FAOLLIGI"
 # =====================================
 
@@ -192,18 +203,56 @@ def result_kb(vid):
     ])
 
 
-# ================= MESSAGE HANDLERS ====
+# ================= COMMANDS ============
 @dp.message(Command("start"))
 async def start(m: Message):
     preload_categories()
     credit = get_credit(m.from_user.id)
+    admin_flag = " (ADMIN)" if is_admin(m.from_user.id) else ""
     await m.answer(
         "👋 YouTube ANALIZ BOT\n\n"
-        f"💳 Kredit: {credit}/{CREDIT_DAILY}\n"
+        f"💳 Kredit: {credit}/{CREDIT_DAILY}{admin_flag}\n"
         "👉 YouTube linkni yuboring"
     )
 
 
+@dp.message(Command("export"))
+async def export_data(m: Message):
+    if not is_admin(m.from_user.id):
+        await m.answer("❌ Bu buyruq faqat admin uchun.")
+        return
+
+    cur.execute("""
+        SELECT user_id, username, video_url, video_id, created_at
+        FROM submissions
+        ORDER BY created_at DESC
+    """)
+    rows = cur.fetchall()
+
+    if not rows:
+        await m.answer("ℹ️ Hozircha hech qanday link yo‘q.")
+        return
+
+    filename = "submissions_export.csv"
+    with open(filename, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "user_id", "username", "video_url", "video_id", "created_at"
+        ])
+        for r in rows:
+            writer.writerow([
+                r[0],
+                r[1] or "",
+                r[2],
+                r[3],
+                datetime.fromtimestamp(r[4]).strftime("%Y-%m-%d %H:%M:%S")
+            ])
+
+    await m.answer_document(FSInputFile(filename))
+# =====================================
+
+
+# ================= ANALYZE ============
 @dp.message(F.text.regexp(YOUTUBE_REGEX))
 async def analyze(m: Message):
     uid = m.from_user.id
@@ -219,16 +268,24 @@ async def analyze(m: Message):
     if not vid:
         return
 
+    cur.execute("""
+        INSERT INTO submissions (user_id, username, video_id, video_url, created_at)
+        VALUES (?,?,?,?,?)
+    """, (
+        uid,
+        m.from_user.username,
+        vid,
+        m.text,
+        int(time.time())
+    ))
+    conn.commit()
+
     now_ts = int(time.time())
     cur.execute("SELECT * FROM videos WHERE video_id=?", (vid,))
     row = cur.fetchone()
 
     if not row or now_ts - row[-1] > TTL_VIDEO:
-        data = yt_api("videos", {
-            "part": "snippet,statistics",
-            "id": vid
-        })
-
+        data = yt_api("videos", {"part": "snippet,statistics", "id": vid})
         it = data["items"][0]
         sn, st = it["snippet"], it["statistics"]
 
@@ -275,7 +332,7 @@ async def analyze(m: Message):
 # =====================================
 
 
-# ================= CALLBACK HANDLERS ===
+# ================= CALLBACKS ===========
 @router.callback_query(F.data.startswith("top:"))
 async def top_videos(c: CallbackQuery):
     vid = c.data.split(":")[1]
@@ -284,18 +341,39 @@ async def top_videos(c: CallbackQuery):
         (vid,)
     ).fetchone()[0]
 
-    data = yt_api("search", {
+    # 1️⃣ search.list
+    search_data = yt_api("search", {
         "part": "snippet",
         "type": "video",
         "order": "viewCount",
         "maxResults": 10,
-        "publishedAfter": (datetime.utcnow()-timedelta(days=30)).isoformat()+"Z",
+        "publishedAfter": (datetime.utcnow() - timedelta(days=30)).isoformat() + "Z",
         "q": title
     })
 
+    video_ids = [it["id"]["videoId"] for it in search_data.get("items", [])[:10]]
+
+    # 2️⃣ videos.list (statistics)
+    stats_data = yt_api("videos", {
+        "part": "statistics",
+        "id": ",".join(video_ids)
+    })
+
+    views_map = {
+        it["id"]: int(it["statistics"].get("viewCount", 0))
+        for it in stats_data.get("items", [])
+    }
+
     text = "🧠 TOP 10 KONKURENT VIDEO:\n\n"
-    for i, it in enumerate(data.get("items", [])[:10], 1):
-        text += f"{i}. {it['snippet']['title']}\nhttps://youtu.be/{it['id']['videoId']}\n\n"
+    for i, it in enumerate(search_data.get("items", [])[:10], 1):
+        v_id = it["id"]["videoId"]
+        title_v = it["snippet"]["title"]
+        views_v = views_map.get(v_id, 0)
+        text += (
+            f"{i}. {title_v}\n"
+            f"👁 {views_v:,}\n"
+            f"https://youtu.be/{v_id}\n\n"
+        )
 
     await c.message.answer(text)
     await c.answer()
@@ -351,7 +429,7 @@ async def tags(c: CallbackQuery):
 # ================= MAIN ================
 async def main():
     dp.include_router(router)
-    print("🤖 BOT ISHLAYAPTI — FINAL, BARQAROR")
+    print("🤖 BOT ISHLAYAPTI — TOP 10 VIEWCOUNT QO‘SHILDI")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
