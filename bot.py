@@ -1,240 +1,278 @@
 import os
 import re
-import sqlite3
+import json
 import asyncio
+import hashlib
+import sqlite3
 from datetime import datetime, timedelta, timezone
 
+import requests
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
-    Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+    Message,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    CallbackQuery
 )
-from aiogram.filters import CommandStart
+from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-
-import requests
 
 # ================== CONFIG ==================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEYS")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+API_KEYS = os.getenv("YOUTUBE_API_KEYS", "").split(",")
 
-ADMIN_IDS = {787803140}  # <-- O'ZINGNING TG ID
+DAILY_CREDIT = 5
+CACHE_TTL = 60 * 60  # 1 soat
 
-CREDIT_LIMIT = 5
-DB_PATH = "data.db"
-
-YOUTUBE_API = "https://www.googleapis.com/youtube/v3"
-
-# ================== DB ==================
-conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-cur = conn.cursor()
-
-cur.execute("""
-CREATE TABLE IF NOT EXISTS users (
-    user_id INTEGER PRIMARY KEY,
-    username TEXT,
-    credits INTEGER,
-    reset_at TEXT
+# ================== BOT INIT =================
+bot = Bot(
+    token=BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
 )
-""")
-
-cur.execute("""
-CREATE TABLE IF NOT EXISTS links (
-    user_id INTEGER,
-    video_id TEXT,
-    UNIQUE(user_id, video_id)
-)
-""")
-
-conn.commit()
-
-# ================== RAM CACHE ==================
-VIDEO_CACHE = {}
-SEARCH_CACHE = {}
-
-# ================== BOT ==================
-bot = Bot(BOT_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher()
 
-# ================== HELPERS ==================
-def extract_video_id(url: str):
-    patterns = [
-        r"v=([a-zA-Z0-9_-]{11})",
-        r"youtu\.be/([a-zA-Z0-9_-]{11})"
-    ]
-    for p in patterns:
-        m = re.search(p, url)
-        if m:
-            return m.group(1)
-    return None
+# ================== DB ======================
+db = sqlite3.connect("bot.db", check_same_thread=False)
+sql = db.cursor()
 
-def get_user(user_id, username):
-    cur.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
-    row = cur.fetchone()
+sql.execute("""
+CREATE TABLE IF NOT EXISTS users(
+    user_id INTEGER PRIMARY KEY,
+    username TEXT,
+    credit INTEGER,
+    last_reset TEXT
+)
+""")
 
-    now = datetime.now(timezone.utc)
+sql.execute("""
+CREATE TABLE IF NOT EXISTS used_links(
+    user_id INTEGER,
+    link_hash TEXT,
+    PRIMARY KEY(user_id, link_hash)
+)
+""")
 
+sql.execute("""
+CREATE TABLE IF NOT EXISTS cache(
+    key TEXT PRIMARY KEY,
+    value TEXT,
+    created INTEGER
+)
+""")
+db.commit()
+
+# ================== RAM CACHE ===============
+RAM = {}
+
+# ================== HELPERS =================
+def now_utc():
+    return datetime.now(timezone.utc)
+
+def reset_credit_if_needed(user_id):
+    sql.execute("SELECT credit,last_reset FROM users WHERE user_id=?", (user_id,))
+    row = sql.fetchone()
     if not row:
-        reset = now + timedelta(days=1)
-        cur.execute(
-            "INSERT INTO users VALUES (?,?,?,?)",
-            (user_id, username, CREDIT_LIMIT, reset.isoformat())
+        sql.execute(
+            "INSERT INTO users VALUES(?,?,?,?)",
+            (user_id, "", DAILY_CREDIT, now_utc().isoformat())
         )
-        conn.commit()
-        return CREDIT_LIMIT, reset
+        db.commit()
+        return DAILY_CREDIT
 
-    credits, reset_at = row[2], datetime.fromisoformat(row[3])
-
-    if now >= reset_at:
-        reset = now + timedelta(days=1)
-        credits = CREDIT_LIMIT
-        cur.execute(
-            "UPDATE users SET credits=?, reset_at=? WHERE user_id=?",
-            (credits, reset.isoformat(), user_id)
+    credit, last = row
+    if now_utc() - datetime.fromisoformat(last) >= timedelta(hours=24):
+        sql.execute(
+            "UPDATE users SET credit=?, last_reset=? WHERE user_id=?",
+            (DAILY_CREDIT, now_utc().isoformat(), user_id)
         )
-        conn.commit()
-        return credits, reset
+        db.commit()
+        return DAILY_CREDIT
+    return credit
 
-    return credits, reset_at
+def take_credit(user_id, link):
+    if user_id == ADMIN_ID:
+        return True
 
-def update_credit(user_id, credits):
-    cur.execute(
-        "UPDATE users SET credits=? WHERE user_id=?",
-        (credits, user_id)
+    h = hashlib.md5(link.encode()).hexdigest()
+    sql.execute(
+        "SELECT 1 FROM used_links WHERE user_id=? AND link_hash=?",
+        (user_id, h)
     )
-    conn.commit()
+    if sql.fetchone():
+        return True
 
-def yt_request(endpoint, params):
-    params["key"] = YOUTUBE_API_KEY
-    r = requests.get(f"{YOUTUBE_API}/{endpoint}", params=params, timeout=10)
-    r.raise_for_status()
+    credit = reset_credit_if_needed(user_id)
+    if credit <= 0:
+        return False
+
+    sql.execute(
+        "UPDATE users SET credit=credit-1 WHERE user_id=?",
+        (user_id,)
+    )
+    sql.execute(
+        "INSERT OR IGNORE INTO used_links VALUES(?,?)",
+        (user_id, h)
+    )
+    db.commit()
+    return True
+
+def get_api():
+    return API_KEYS[int(datetime.utcnow().timestamp()) % len(API_KEYS)]
+
+def yt(endpoint, params):
+    params["key"] = get_api()
+    r = requests.get(f"https://www.googleapis.com/youtube/v3/{endpoint}", params=params, timeout=15)
+    if r.status_code != 200:
+        raise Exception("YT API error")
     return r.json()
 
-# ================== START ==================
-@dp.message(CommandStart())
-async def start(msg: Message):
-    await msg.answer(
+def cache_get(k):
+    if k in RAM:
+        return RAM[k]
+    sql.execute("SELECT value,created FROM cache WHERE key=?", (k,))
+    r = sql.fetchone()
+    if r and time.time() - r[1] < CACHE_TTL:
+        RAM[k] = json.loads(r[0])
+        return RAM[k]
+    return None
+
+def cache_set(k, v):
+    RAM[k] = v
+    sql.execute(
+        "REPLACE INTO cache VALUES(?,?,?)",
+        (k, json.dumps(v), int(time.time()))
+    )
+    db.commit()
+
+# ================== START ===================
+@dp.message(F.text == "/start")
+async def start(m: Message):
+    await m.answer(
         "👋 <b>Salom!</b>\n\n"
-        "YouTube video havolasini yuboring.\n\n"
-        "Men sizga:\n"
-        "🧠 TOP nomlar\n"
-        "🏷 Tag / Tavsif\n"
-        "📺 Raqobatchi kanallar\n"
-        "🚨 Nakrutka tekshiruv\n"
-        "🎟 Kredit nazorati\n\n"
-        "chiqarib beraman."
+        "YouTube video link yuboring.\n"
+        "🎟 Kredit: 5/5 (har 24 soatda yangilanadi)"
     )
 
-# ================== VIDEO HANDLE ==================
-@dp.message(F.text.startswith("http"))
-async def handle_video(msg: Message):
-    user_id = msg.from_user.id
-    username = msg.from_user.username or ""
+# ================== VIDEO ===================
+@dp.message(F.text.regexp(r"youtu"))
+async def handle_video(m: Message):
+    link = m.text.strip()
 
-    vid = extract_video_id(msg.text)
-    if not vid:
-        await msg.answer("❌ Video topilmadi.")
+    if not take_credit(m.from_user.id, link):
+        await m.answer("❌ Kredit tugadi. 24 soat kuting.")
         return
 
-    credits, reset_at = get_user(user_id, username)
+    await m.answer("⏳ Video analiz qilinmoqda...")
 
-    if user_id not in ADMIN_IDS:
-        cur.execute(
-            "SELECT 1 FROM links WHERE user_id=? AND video_id=?",
-            (user_id, vid)
-        )
-        if not cur.fetchone():
-            if credits <= 0:
-                await msg.answer("❌ Kredit tugadi.")
-                return
-            credits -= 1
-            update_credit(user_id, credits)
-            cur.execute(
-                "INSERT OR IGNORE INTO links VALUES (?,?)",
-                (user_id, vid)
-            )
-            conn.commit()
+    vid = re.findall(r"(?:v=|be/)([\w-]{11})", link)
+    if not vid:
+        await m.answer("❌ Video topilmadi.")
+        return
+    vid = vid[0]
 
-    if vid in VIDEO_CACHE:
-        data = VIDEO_CACHE[vid]
-    else:
-        data = yt_request(
-            "videos",
-            {
-                "part": "snippet,statistics",
-                "id": vid
-            }
-        )
-        if not data["items"]:
-            await msg.answer("❌ Video topilmadi yoki API cheklangan.")
-            return
-        VIDEO_CACHE[vid] = data
+    data = yt("videos", {
+        "part": "snippet,statistics",
+        "id": vid
+    })["items"][0]
 
-    item = data["items"][0]
-    s = item["snippet"]
-    st = item["statistics"]
+    sn = data["snippet"]
+    st = data["statistics"]
 
-    title = s["title"]
-    channel = s["channelTitle"]
+    published = datetime.fromisoformat(sn["publishedAt"].replace("Z","+00:00"))
+    tz_time = published + timedelta(hours=5)
 
-    published = datetime.fromisoformat(
-        s["publishedAt"].replace("Z", "+00:00")
-    ).astimezone(timezone(timedelta(hours=5)))
-
-    views = int(st.get("viewCount", 0))
-    likes = int(st.get("likeCount", 0))
-    comments = int(st.get("commentCount", 0))
-
-    nakrutka = "🔴 ehtimoli yuqori" if likes > views else "🟢 normal"
-
-    text = (
-        f"🎬 <b>{title}</b>\n\n"
-        f"🕒 Yuklangan: {published:%Y-%m-%d %H:%M} (Toshkent vaqti)\n"
-        f"📺 Kanal: <b>{channel}</b>\n\n"
-        f"👁 {views}   👍 {likes}   💬 {comments}\n"
-        f"⚠️ Likelar soni: {nakrutka}\n"
-        f"🎟 Kredit: {credits}/{CREDIT_LIMIT} (har 24 soatda yangilanadi)"
-    )
+    like = int(st.get("likeCount", 0))
+    view = int(st.get("viewCount", 1))
+    nakrutka = "🔴 Yuqori" if like/view > 0.3 else "🟢 Normal"
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton("🧠 TOP KONKURENT NOMLAR", callback_data=f"titles:{vid}")],
-        [InlineKeyboardButton("🏷 TAG / TAVSIF", callback_data=f"tags:{vid}")],
-        [InlineKeyboardButton("📺 RAQOBATCHI KANALLAR", callback_data=f"channels:{vid}")]
+        [InlineKeyboardButton(text="🧠 TOP KONKURENT NOMLAR", callback_data=f"top:{vid}")],
+        [InlineKeyboardButton(text="🏷 TAG / TAVSIF", callback_data=f"tag:{vid}")],
+        [InlineKeyboardButton(text="📺 RAQOBATCHI KANALLAR", callback_data=f"ch:{vid}")]
     ])
 
-    await msg.answer(text, reply_markup=kb)
+    await m.answer_photo(
+        photo=sn["thumbnails"]["high"]["url"],
+        caption=(
+            f"🎬 <b>{sn['title']}</b>\n\n"
+            f"🕒 Yuklangan: {tz_time:%Y-%m-%d %H:%M} (Toshkent vaqti)\n"
+            f"📺 Kanal: {sn['channelTitle']}\n\n"
+            f"👁 {view}   👍 {like}   💬 {st.get('commentCount',0)}\n"
+            f"⚠️ Likelar soni: {nakrutka}\n"
+            f"🎟 Kredit: {reset_credit_if_needed(m.from_user.id)}/{DAILY_CREDIT} (har 24 soatda yangilanadi)"
+        ),
+        reply_markup=kb
+    )
 
-# ================== CALLBACKS ==================
-@dp.callback_query(F.data.startswith("titles:"))
-async def cb_titles(call: CallbackQuery):
-    await call.answer("Analiz qilinmoqda...")
-    await call.message.answer("🧠 TOP KONKURENT NOMLAR (30 kun)...\n(tez orada)")
+# ================== TOP TITLES ==============
+@dp.callback_query(F.data.startswith("top:"))
+async def top_titles(c: CallbackQuery):
+    vid = c.data.split(":")[1]
+    await c.answer("⏳ Olinmoqda...", show_alert=False)
 
-@dp.callback_query(F.data.startswith("tags:"))
-async def cb_tags(call: CallbackQuery):
-    await call.answer()
-    await call.message.answer(
+    v = yt("videos", {"part":"snippet","id":vid})["items"][0]
+    q = v["snippet"]["title"].split("|")[0][:50]
+
+    res = yt("search", {
+        "part":"snippet",
+        "q":q,
+        "type":"video",
+        "order":"viewCount",
+        "maxResults":10
+    })["items"]
+
+    text = "🧠 <b>TOP KONKURENT NOMLAR (30 kun)</b>\n\n"
+    for i,x in enumerate(res,1):
+        t = x["snippet"]["title"]
+        link = f"https://youtu.be/{x['id']['videoId']}"
+        text += f"{i}. <a href='{link}'>{t}</a>\n"
+
+    await c.message.answer(text)
+
+# ================== TAG / DESC ==============
+@dp.callback_query(F.data.startswith("tag:"))
+async def tags(c: CallbackQuery):
+    vid = c.data.split(":")[1]
+    v = yt("videos", {"part":"snippet","id":vid})["items"][0]
+    sn = v["snippet"]
+
+    tags = ", ".join(sn.get("tags", [])[:40])
+    desc = sn.get("description","")[:3000]
+
+    await c.message.answer(
         "🏷 <b>TAG / TAVSIF</b>\n\n"
-        "<b>Video taglari:</b>\n"
-        "```\nexample, tags, here\n```\n\n"
-        "<b>Kanal taglari:</b>\n"
-        "```\nchannel, tags\n```\n\n"
-        "<b>Description:</b>\n"
-        "```\nVideo description...\n```"
+        "<code>Video taglari:\n"
+        f"{tags}\n\n"
+        "Video description:\n"
+        f"{desc}</code>"
     )
 
-@dp.callback_query(F.data.startswith("channels:"))
-async def cb_channels(call: CallbackQuery):
-    await call.answer()
-    await call.message.answer(
-        "📺 <b>RAQOBATCHI KANALLAR (TOP)</b>\n\n"
-        "1. BNG OYOT\n"
-        "2. OBA BeamNG\n"
-        "3. BeamNG Family"
-    )
+# ================== CHANNELS =================
+@dp.callback_query(F.data.startswith("ch:"))
+async def channels(c: CallbackQuery):
+    vid = c.data.split(":")[1]
+    v = yt("videos", {"part":"snippet","id":vid})["items"][0]
+    title = v["snippet"]["title"].split()[0]
 
-# ================== MAIN ==================
+    res = yt("search", {
+        "part":"snippet",
+        "q":title,
+        "type":"channel",
+        "maxResults":10
+    })["items"]
+
+    txt = "📺 <b>RAQOBATCHI KANALLAR</b>\n\n"
+    for i,x in enumerate(res,1):
+        ch = x["snippet"]["channelTitle"]
+        link = f"https://youtube.com/channel/{x['id']['channelId']}"
+        txt += f"{i}. <a href='{link}'>{ch}</a>\n"
+
+    await c.message.answer(txt)
+
+# ================== RUN =====================
 async def main():
-    await bot.delete_webhook(drop_pending_updates=True)
+    print("🤖 BOT ISHGA TUSHDI")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
