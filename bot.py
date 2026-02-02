@@ -27,7 +27,7 @@ dp = Dispatcher()
 
 # ================= CACHE =================
 CACHE = {}
-CACHE_TTL = 1800  # 30 min
+CACHE_TTL = 1800  # 30 daqiqa
 
 def now():
     return int(datetime.now(tz=timezone.utc).timestamp())
@@ -99,7 +99,7 @@ def main_keyboard(video_id):
             ],
             [
                 InlineKeyboardButton(
-                    text="📺 Raqobatchi kanallar",
+                    text="📺 RAQOBATCHI KANALLAR",
                     callback_data=f"competitors:{video_id}"
                 )
             ]
@@ -112,10 +112,7 @@ async def start(m: Message):
     await m.answer(
         "👋 <b>Salom!</b>\n\n"
         "🔗 YouTube video linkini yuboring.\n\n"
-        "Men sizga:\n"
-        "🧠 TOP konkurent nomlar (30 kun)\n"
-        "🏷 TAG / TAVSIF\n"
-        "📺 Raqobatchi kanallarni chiqaraman."
+        "Men sizga real analiz chiqaraman."
     )
 
 # ================= VIDEO =================
@@ -136,14 +133,40 @@ async def handle_video(m: Message):
     sn = video["snippet"]
     st = video["statistics"]
 
-    text = (
+    # Toshkent vaqti
+    published = datetime.fromisoformat(
+        sn["publishedAt"].replace("Z", "+00:00")
+    ).astimezone(timezone(timedelta(hours=5)))
+
+    # Thumbnail (high quality)
+    thumbs = sn.get("thumbnails", {})
+    thumb_url = (
+        thumbs.get("maxres", {}) or
+        thumbs.get("standard", {}) or
+        thumbs.get("high", {}) or
+        thumbs.get("medium", {})
+    ).get("url")
+
+    caption = (
         f"🎬 <b>{sn['title']}</b>\n\n"
-        f"👁 {st.get('viewCount','0')}   "
-        f"👍 {st.get('likeCount','0')}   "
-        f"💬 {st.get('commentCount','0')}"
+        f"🕒 Yuklangan: {published.strftime('%d.%m.%Y %H:%M')} "
+        f"(Toshkent vaqti)\n\n"
+        f"📂 Kategoriya:\n"
+        f"🇬🇧 Gaming / 🇷🇺 Игры / 🇺🇿 O‘yinlar\n\n"
+        f"📊 <b>Video statistikasi</b>\n"
+        f"👁 View: {st.get('viewCount','0')}\n"
+        f"👍 Like: {st.get('likeCount','0')}\n"
+        f"💬 Comment: {st.get('commentCount','0')}"
     )
 
-    await m.answer(text, reply_markup=main_keyboard(vid))
+    if thumb_url:
+        await m.answer_photo(
+            photo=thumb_url,
+            caption=caption,
+            reply_markup=main_keyboard(vid)
+        )
+    else:
+        await m.answer(caption, reply_markup=main_keyboard(vid))
 
 # ================= TOP TITLES =================
 @dp.callback_query(F.data.startswith("top_titles"))
@@ -157,7 +180,6 @@ async def top_titles(cb: CallbackQuery):
         return
 
     base_q = video["snippet"]["title"].split("|")[0]
-
     after = (datetime.now(tz=timezone.utc) - timedelta(days=30)).isoformat()
 
     search = yt("search", {
@@ -204,7 +226,7 @@ async def top_titles(cb: CallbackQuery):
 # ================= TAG / DESCRIPTION =================
 @dp.callback_query(F.data.startswith("tags_desc"))
 async def tags_desc(cb: CallbackQuery):
-    await cb.answer("⏳ Taglar va tavsif olinmoqda...")
+    await cb.answer("⏳ Tag va tavsif olinmoqda...")
 
     vid = cb.data.split(":")[1]
     video = get_video(vid)
@@ -212,17 +234,17 @@ async def tags_desc(cb: CallbackQuery):
         await cb.message.answer("❌ Video topilmadi.")
         return
 
-    title = video["snippet"]["title"].lower()
-    desc = video["snippet"].get("description", "")
+    sn = video["snippet"]
+    title = sn["title"].lower()
+    desc = sn.get("description", "")
 
-    video_tags = set(re.findall(r"\b[a-zA-Z]{4,}\b", title))
-    channel_tags = set(video_tags)
+    words = set(re.findall(r"\b[a-zA-Z]{4,}\b", title))
 
     txt = (
         "🏷 <b>Video taglari:</b>\n"
-        f"<code>{', '.join(sorted(video_tags))}</code>\n\n"
+        f"<code>{', '.join(sorted(words))}</code>\n\n"
         "📌 <b>Kanal taglari:</b>\n"
-        f"<code>{', '.join(sorted(channel_tags))}</code>\n\n"
+        f"<code>{', '.join(sorted(words))}</code>\n\n"
         "📝 <b>Video description:</b>\n"
         f"<code>{desc[:3500]}</code>"
     )
@@ -232,7 +254,7 @@ async def tags_desc(cb: CallbackQuery):
 # ================= COMPETITORS =================
 @dp.callback_query(F.data.startswith("competitors"))
 async def competitors(cb: CallbackQuery):
-    await cb.answer("⏳ Raqobatchi kanallar analiz qilinmoqda...")
+    await cb.answer("⏳ Raqobatchi kanallar olinmoqda...")
 
     vid = cb.data.split(":")[1]
     video = get_video(vid)
