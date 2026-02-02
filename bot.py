@@ -19,13 +19,17 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 
 if not BOT_TOKEN or not YOUTUBE_API_KEY:
-    raise RuntimeError("ENV sozlanmagan")
+    raise RuntimeError("BOT_TOKEN yoki YOUTUBE_API_KEY ENV yo‘q")
 
 TZ = pytz.timezone("Asia/Tashkent")
 
 # ================= BOT =================
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
+
+# ================= CACHE (Google Trends) =================
+TREND_CACHE = {}  # keyword -> (timestamp, {"photo": BufferedInputFile, "caption": str})
+CACHE_TTL = 1800  # 30 daqiqa
 
 # ================= HELPERS =================
 def get_video_id(url: str):
@@ -36,7 +40,7 @@ def extract_keyword(title: str):
     words = title.split()
     return " ".join(words[:3]) if len(words) >= 3 else title
 
-# ================= YOUTUBE =================
+# ================= YOUTUBE API =================
 def yt_video(video_id: str):
     url = (
         "https://www.googleapis.com/youtube/v3/videos"
@@ -61,14 +65,14 @@ def yt_search(keyword: str, limit=10):
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message):
     await message.answer(
-        "🧪 *YouTube Analyser TEST BOT*\n\n"
+        "🧪 *YouTube Analyser — TEST*\n\n"
         "📌 YouTube video havolasini yuboring.\n"
-        "🔘 Qo‘shimcha analizlar inline tugmalar orqali.\n"
+        "🔘 Inline tugmalar orqali qo‘shimcha analiz.\n"
         "🌍 Google Trends: GLOBAL + grafik",
         parse_mode="Markdown"
     )
 
-# ================= MAIN ANALYSIS =================
+# ================= MAIN =================
 @dp.message()
 async def handle_video(message: types.Message):
     url = (message.text or "").strip()
@@ -135,7 +139,7 @@ async def handle_video(message: types.Message):
 
     await message.answer(text, parse_mode="Markdown", reply_markup=keyboard)
 
-# ================= SEARCH ANALYSIS =================
+# ================= SEARCH =================
 @dp.callback_query(F.data.startswith("search:"))
 async def search_cb(call: types.CallbackQuery):
     keyword = call.data.split("search:", 1)[1]
@@ -169,55 +173,84 @@ async def search_cb(call: types.CallbackQuery):
 # ================= GOOGLE TRENDS + GRAPH =================
 @dp.callback_query(F.data.startswith("trend:"))
 async def trend_cb(call: types.CallbackQuery):
-    keyword = call.data.split("trend:", 1)[1]
+    keyword = call.data.split("trend:", 1)[1].strip().lower()
+    now = datetime.now().timestamp()
 
-    pytrends = TrendReq(hl="en-US", tz=360)
-    pytrends.build_payload([keyword], timeframe="today 3-m")
-    data = pytrends.interest_over_time()
+    # CACHE (30 daqiqa)
+    if keyword in TREND_CACHE:
+        ts, cached = TREND_CACHE[keyword]
+        if now - ts < CACHE_TTL:
+            await call.message.answer_photo(
+                cached["photo"],
+                caption=cached["caption"],
+                parse_mode="Markdown"
+            )
+            await call.answer()
+            return
 
-    if data.empty:
-        await call.message.answer("❌ Google Trends ma’lumot topilmadi.")
-        await call.answer()
-        return
+    await call.message.answer("📈 Global trend olinmoqda, biroz kuting...")
 
-    # Grafik chizish
-    plt.figure()
-    data[keyword].plot()
-    plt.title(f"Google Trends (Global): {keyword}")
-    plt.xlabel("Sana")
-    plt.ylabel("Qiziqish darajasi")
-    plt.tight_layout()
+    try:
+        pytrends = TrendReq(hl="en-US", tz=360)
+        pytrends.build_payload([keyword], timeframe="today 3-m")
+        data = pytrends.interest_over_time()
 
-    buf = BytesIO()
-    plt.savefig(buf, format="png")
-    plt.close()
-    buf.seek(0)
+        if data.empty:
+            await call.message.answer("❌ Trend ma’lumot topilmadi.")
+            await call.answer()
+            return
 
-    start = data[keyword].iloc[0]
-    end = data[keyword].iloc[-1]
-    diff = end - start
+        plt.figure()
+        data[keyword].plot()
+        plt.title(f"Google Trends (Global): {keyword}")
+        plt.xlabel("Sana")
+        plt.ylabel("Qiziqish")
+        plt.tight_layout()
 
-    if diff > 10:
-        trend_text = "🟢 Kuchli o‘sish"
-    elif diff > 0:
-        trend_text = "🟡 Sekin o‘sish"
-    elif diff == 0:
-        trend_text = "⚪ Barqaror"
-    else:
-        trend_text = "🔴 Pasayish"
+        buf = BytesIO()
+        plt.savefig(buf, format="png")
+        plt.close()
+        buf.seek(0)
 
-    caption = (
-        f"📈 *Google Trends (Global)*\n\n"
-        f"🔑 Keyword: *{keyword}*\n"
-        f"⏱ Davr: Oxirgi 3 oy\n\n"
-        f"📊 Natija: {trend_text}"
-    )
+        start = data[keyword].iloc[0]
+        end = data[keyword].iloc[-1]
+        diff = end - start
 
-    await call.message.answer_photo(
-        types.BufferedInputFile(buf.read(), filename="trend.png"),
-        caption=caption,
-        parse_mode="Markdown"
-    )
+        if diff > 10:
+            trend_text = "🟢 Kuchli o‘sish"
+        elif diff > 0:
+            trend_text = "🟡 Sekin o‘sish"
+        elif diff == 0:
+            trend_text = "⚪ Barqaror"
+        else:
+            trend_text = "🔴 Pasayish"
+
+        caption = (
+            f"📈 *Global trend*\n\n"
+            f"🔑 Keyword: *{keyword}*\n"
+            f"⏱ Oxirgi 3 oy\n\n"
+            f"📊 Natija: {trend_text}"
+        )
+
+        photo = types.BufferedInputFile(buf.read(), filename="trend.png")
+
+        TREND_CACHE[keyword] = (
+            now,
+            {"photo": photo, "caption": caption}
+        )
+
+        await call.message.answer_photo(
+            photo,
+            caption=caption,
+            parse_mode="Markdown"
+        )
+
+    except Exception:
+        await call.message.answer(
+            "⚠️ Hozir global trend vaqtincha mavjud emas.\n"
+            "Iltimos, birozdan keyin qayta urinib ko‘ring."
+        )
+
     await call.answer()
 
 # ================= RUN =================
