@@ -3,7 +3,9 @@ from datetime import datetime, timedelta, timezone
 import requests
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.types import (
+    Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+)
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart
 from aiogram.client.default import DefaultBotProperties
@@ -13,8 +15,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_KEYS = [k.strip() for k in os.getenv("YOUTUBE_API_KEYS","").split(",") if k.strip()]
 ADMIN_ID = int(os.getenv("ADMIN_ID","0"))
 
-TZ_TASHKENT = timezone(timedelta(hours=5))
 DAILY_CREDITS = 5
+TZ_TASHKENT = timezone(timedelta(hours=5))
 
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
@@ -43,9 +45,9 @@ CREATE TABLE IF NOT EXISTS users (
 cur.execute("""
 CREATE TABLE IF NOT EXISTS requests (
     user_id INTEGER,
-    username TEXT,
     link TEXT,
-    ts INTEGER
+    ts INTEGER,
+    UNIQUE(user_id, link)
 )
 """)
 
@@ -54,7 +56,7 @@ db.commit()
 RAM = {}
 CACHE_TTL = 3600
 
-# ================= HELPERS =================
+# ================= CACHE =================
 def cache_get(key):
     if key in RAM:
         return RAM[key]
@@ -74,17 +76,17 @@ def cache_set(key, data):
     )
     db.commit()
 
+# ================= CREDIT =================
 def next_reset_ts():
-    # Google API reset ≈ 00:00 PT → ~18:00 Toshkent
     now = datetime.now(TZ_TASHKENT)
     reset = now.replace(hour=18, minute=0, second=0, microsecond=0)
     if now >= reset:
         reset += timedelta(days=1)
     return int(reset.timestamp())
 
-def get_user(user):
+def get_user_credits(user):
     if user.id == ADMIN_ID:
-        return None  # admin cheklanmaydi
+        return None
 
     cur.execute("SELECT credits, reset_ts FROM users WHERE user_id=?", (user.id,))
     row = cur.fetchone()
@@ -109,20 +111,34 @@ def get_user(user):
 
     return credits
 
-def use_credit(user):
-    if user.id == ADMIN_ID:
-        return True
+def link_used_before(user_id, link):
+    cur.execute(
+        "SELECT 1 FROM requests WHERE user_id=? AND link=?",
+        (user_id, link)
+    )
+    return cur.fetchone() is not None
 
-    credits = get_user(user)
+def use_credit_if_new(user, link):
+    if user.id == ADMIN_ID:
+        return True, None
+
+    if link_used_before(user.id, link):
+        return True, get_user_credits(user)
+
+    credits = get_user_credits(user)
     if credits <= 0:
-        return False
+        return False, 0
 
     cur.execute(
         "UPDATE users SET credits=credits-1 WHERE user_id=?",
         (user.id,)
     )
+    cur.execute(
+        "INSERT OR IGNORE INTO requests VALUES (?,?,?)",
+        (user.id, link, int(time.time()))
+    )
     db.commit()
-    return True
+    return True, credits - 1
 
 # ================= YT =================
 def yt(endpoint, params):
@@ -144,6 +160,20 @@ def extract_video_id(url):
     m = re.search(r"(v=|be/)([\w\-]{11})", url)
     return m.group(2) if m else None
 
+def tashkent_time(iso):
+    dt = datetime.fromisoformat(iso.replace("Z","+00:00"))
+    return dt.astimezone(TZ_TASHKENT).strftime("%d.%m.%Y %H:%M")
+
+def like_nakrutka(views, likes):
+    if views == 0:
+        return "⚪ Maʼlumot yetarli emas"
+    r = likes / views
+    if r > 0.3:
+        return "🔴 Nakrutka ehtimoli yuqori"
+    if r > 0.15:
+        return "🟡 Shubhali"
+    return "🟢 Normal"
+
 # ================= BOT =================
 @dp.message(CommandStart())
 async def start(m: Message):
@@ -155,51 +185,43 @@ async def handle(m: Message):
     if not vid:
         return
 
-    if not use_credit(m.from_user):
+    ok, credits_left = use_credit_if_new(m.from_user, m.text)
+    if not ok:
         await m.answer("❌ Bugungi kredit tugadi. Ertaga qayta urinib ko‘ring.")
         return
-
-    cur.execute(
-        "INSERT INTO requests VALUES (?,?,?,?)",
-        (m.from_user.id, m.from_user.username, m.text, int(time.time()))
-    )
-    db.commit()
-
-    credits_left = get_user(m.from_user)
 
     msg = await m.answer("⏳ Analiz qilinmoqda...")
 
     js = yt("videos", {"part":"snippet,statistics","id":vid})
     it = js["items"][0]
 
-    text = (
-        f"🎬 <b>{it['snippet']['title']}</b>\n\n"
-        f"📺 Kanal: {it['snippet']['channelTitle']}\n"
-        f"👁 {it['statistics'].get('viewCount','0')}   "
-        f"👍 {it['statistics'].get('likeCount','0')}   "
-        f"💬 {it['statistics'].get('commentCount','0')}\n\n"
-        f"🎟 Kredit: {credits_left}/{DAILY_CREDITS}"
+    nak = like_nakrutka(
+        int(it["statistics"].get("viewCount",0)),
+        int(it["statistics"].get("likeCount",0))
     )
 
-    await msg.edit_text(text)
-
-# ================= ADMIN EXPORT =================
-@dp.message(F.text == "/export")
-async def export(m: Message):
+    credit_line = ""
     if m.from_user.id != ADMIN_ID:
-        return
+        credit_line = f"\n🎟 Kredit: {credits_left}/{DAILY_CREDITS} (har 24 soatda yangilanadi)"
 
-    cur.execute("SELECT * FROM requests")
-    rows = cur.fetchall()
+    text = (
+        f"🎬 <b>{it['snippet']['title']}</b>\n\n"
+        f"🕒 Yuklangan: {tashkent_time(it['snippet']['publishedAt'])} (Toshkent vaqti)\n"
+        f"📺 Kanal: {it['snippet']['channelTitle']}\n\n"
+        f"👁 {it['statistics'].get('viewCount','0')}   "
+        f"👍 {it['statistics'].get('likeCount','0')}   "
+        f"💬 {it['statistics'].get('commentCount','0')}\n"
+        f"⚠️ Likelar soni {nak}"
+        f"{credit_line}"
+    )
 
-    txt = ""
-    for r in rows:
-        txt += f"{r[0]} | @{r[1]} | {r[2]} | {datetime.fromtimestamp(r[3])}\n"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🧠 TOP KONKURENT NOMLAR", callback_data=f"title:{vid}")],
+        [InlineKeyboardButton(text="🏷 TAG / TAVSIF", callback_data=f"tags:{vid}")],
+        [InlineKeyboardButton(text="📺 RAQOBATCHI KANALLAR", callback_data=f"comp:{vid}")]
+    ])
 
-    with open("export.txt","w",encoding="utf-8") as f:
-        f.write(txt)
-
-    await m.answer_document(open("export.txt","rb"))
+    await msg.edit_text(text, reply_markup=kb)
 
 # ================= RUN =================
 async def main():
