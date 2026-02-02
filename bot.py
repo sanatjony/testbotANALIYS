@@ -3,7 +3,6 @@ import re
 import sqlite3
 import time
 import os
-import csv
 import requests
 from datetime import datetime, timedelta, timezone
 
@@ -92,6 +91,14 @@ def extract_video_id(url: str):
         if m:
             return m.group(1)
     return None
+
+def detect_youtube_link_type(url: str):
+    url = url.lower()
+    if re.search(r"(watch\?v=|youtu\.be/|/shorts/)", url):
+        return "video"
+    if re.search(r"/channel/|/c/|/user/|/@", url):
+        return "channel"
+    return "unknown"
 
 def yt_api(endpoint, params):
     params["key"] = YOUTUBE_API_KEY
@@ -207,17 +214,23 @@ def result_kb(vid):
 @dp.message(Command("start"))
 async def start(m: Message):
     preload_categories()
-    credit = get_credit(m.from_user.id)
-    admin_flag = " (ADMIN)" if is_admin(m.from_user.id) else ""
+    name = m.from_user.first_name or "do‘st"
+
+    if is_admin(m.from_user.id):
+        credit_text = "∞ (ADMIN)"
+    else:
+        credit_text = f"{get_credit(m.from_user.id)}/{CREDIT_DAILY} (creditlar 24 soatda bir yangilanadi)"
+
     await m.answer(
-        "👋 YouTube ANALIZ BOT\n\n"
-        f"💳 Kredit: {credit}/{CREDIT_DAILY}{admin_flag}\n"
-        "👉 YouTube linkni yuboring"
+        f"Assalom aleykum, {name} 👋\n\n"
+        f"📊 YouTube ANALIZ BOTI\n\n"
+        f"💳 Kredit: {credit_text}\n\n"
+        f"👉 YouTube linkni yuboring va tezkor analiz qilamiz!!!"
     )
 
 
 @dp.message(Command("export"))
-async def export_data(m: Message):
+async def export_txt(m: Message):
     if not is_admin(m.from_user.id):
         await m.answer("❌ Bu buyruq faqat admin uchun.")
         return
@@ -233,20 +246,17 @@ async def export_data(m: Message):
         await m.answer("ℹ️ Hozircha hech qanday link yo‘q.")
         return
 
-    filename = "submissions_export.csv"
-    with open(filename, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            "user_id", "username", "video_url", "video_id", "created_at"
-        ])
+    filename = "submissions_export.txt"
+    with open(filename, "w", encoding="utf-8") as f:
         for r in rows:
-            writer.writerow([
-                r[0],
-                r[1] or "",
-                r[2],
-                r[3],
-                datetime.fromtimestamp(r[4]).strftime("%Y-%m-%d %H:%M:%S")
-            ])
+            ts = datetime.fromtimestamp(r[4]).strftime("%Y-%m-%d %H:%M:%S")
+            f.write(
+                f"📅 {ts}\n"
+                f"👤 @{r[1] or 'no_username'} ({r[0]})\n"
+                f"🔗 {r[2]}\n"
+                f"🆔 {r[3]}\n"
+                "------------------------------\n\n"
+            )
 
     await m.answer_document(FSInputFile(filename))
 # =====================================
@@ -255,10 +265,21 @@ async def export_data(m: Message):
 # ================= ANALYZE ============
 @dp.message(F.text.regexp(YOUTUBE_REGEX))
 async def analyze(m: Message):
-    uid = m.from_user.id
-    credit = get_credit(uid)
+    link_type = detect_youtube_link_type(m.text)
 
-    if credit <= 0:
+    if link_type == "channel":
+        await m.answer(
+            "❌ Bu **YouTube kanal linki**.\n\n"
+            "👉 Iltimos, **aniq video link** yuboring."
+        )
+        return
+
+    if link_type != "video":
+        await m.answer("❌ YouTube linkini aniqlab bo‘lmadi.")
+        return
+
+    uid = m.from_user.id
+    if get_credit(uid) <= 0:
         await m.answer("❌ Kredit tugagan. 24 soatda yangilanadi.")
         return
 
@@ -289,8 +310,6 @@ async def analyze(m: Message):
         it = data["items"][0]
         sn, st = it["snippet"], it["statistics"]
 
-        category = resolve_category(sn.get("categoryId"))
-
         cur.execute("""
             INSERT OR REPLACE INTO videos
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
@@ -299,7 +318,7 @@ async def analyze(m: Message):
             sn["title"],
             sn["channelTitle"],
             sn["channelId"],
-            category,
+            resolve_category(sn.get("categoryId")),
             sn["publishedAt"],
             int(st.get("viewCount", 0)),
             int(st.get("likeCount", 0)),
@@ -312,12 +331,8 @@ async def analyze(m: Message):
         row = cur.execute("SELECT * FROM videos WHERE video_id=?", (vid,)).fetchone()
 
     _, title, channel, cid, category, published, views, likes, comments, tags, desc, _ = row
-
     dt = datetime.fromisoformat(published.replace("Z", "+00:00"))
     hours = (datetime.now(timezone.utc) - dt).total_seconds() / 3600
-    fraud = detect_like_fraud(views, likes, comments, hours)
-
-    credit_left = get_credit(uid)
 
     await m.answer(
         f"🎬 {title}\n"
@@ -325,8 +340,8 @@ async def analyze(m: Message):
         f"📺 Kanal: {channel}\n"
         f"⏰ Yuklangan: {dt.strftime('%Y-%m-%d %H:%M')} UTC\n\n"
         f"👁 {views}   👍 {likes}   💬 {comments}\n"
-        f"🚨 {fraud}\n\n"
-        f"💳 Qolgan kredit: {credit_left}/{CREDIT_DAILY}",
+        f"🚨 {detect_like_fraud(views, likes, comments, hours)}\n\n"
+        f"💳 Qolgan kredit: {get_credit(uid)}/{CREDIT_DAILY}",
         reply_markup=result_kb(vid)
     )
 # =====================================
@@ -336,12 +351,8 @@ async def analyze(m: Message):
 @router.callback_query(F.data.startswith("top:"))
 async def top_videos(c: CallbackQuery):
     vid = c.data.split(":")[1]
-    title = cur.execute(
-        "SELECT title FROM videos WHERE video_id=?",
-        (vid,)
-    ).fetchone()[0]
+    title = cur.execute("SELECT title FROM videos WHERE video_id=?", (vid,)).fetchone()[0]
 
-    # 1️⃣ search.list
     search_data = yt_api("search", {
         "part": "snippet",
         "type": "video",
@@ -351,29 +362,14 @@ async def top_videos(c: CallbackQuery):
         "q": title
     })
 
-    video_ids = [it["id"]["videoId"] for it in search_data.get("items", [])[:10]]
-
-    # 2️⃣ videos.list (statistics)
-    stats_data = yt_api("videos", {
-        "part": "statistics",
-        "id": ",".join(video_ids)
-    })
-
-    views_map = {
-        it["id"]: int(it["statistics"].get("viewCount", 0))
-        for it in stats_data.get("items", [])
-    }
+    ids = [it["id"]["videoId"] for it in search_data.get("items", [])]
+    stats = yt_api("videos", {"part": "statistics", "id": ",".join(ids)})
+    views_map = {i["id"]: int(i["statistics"].get("viewCount", 0)) for i in stats["items"]}
 
     text = "🧠 TOP 10 KONKURENT VIDEO:\n\n"
     for i, it in enumerate(search_data.get("items", [])[:10], 1):
-        v_id = it["id"]["videoId"]
-        title_v = it["snippet"]["title"]
-        views_v = views_map.get(v_id, 0)
-        text += (
-            f"{i}. {title_v}\n"
-            f"👁 {views_v:,}\n"
-            f"https://youtu.be/{v_id}\n\n"
-        )
+        v = it["id"]["videoId"]
+        text += f"{i}. {it['snippet']['title']}\n👁 {views_map.get(v,0):,}\nhttps://youtu.be/{v}\n\n"
 
     await c.message.answer(text)
     await c.answer()
@@ -382,10 +378,7 @@ async def top_videos(c: CallbackQuery):
 @router.callback_query(F.data.startswith("channels:"))
 async def channels(c: CallbackQuery):
     vid = c.data.split(":")[1]
-    title = cur.execute(
-        "SELECT title FROM videos WHERE video_id=?",
-        (vid,)
-    ).fetchone()[0]
+    title = cur.execute("SELECT title FROM videos WHERE video_id=?", (vid,)).fetchone()[0]
 
     data = yt_api("search", {
         "part": "snippet",
@@ -410,10 +403,7 @@ async def tags(c: CallbackQuery):
         (vid,)
     ).fetchone()
 
-    data = yt_api("channels", {
-        "part": "brandingSettings",
-        "id": cid
-    })
+    data = yt_api("channels", {"part": "brandingSettings", "id": cid})
     ctags = data["items"][0]["brandingSettings"]["channel"].get("keywords", "")
 
     await c.message.answer("🏷 VIDEO TAGLAR:\n```\n"+vtags+"\n```", parse_mode="Markdown")
@@ -421,7 +411,6 @@ async def tags(c: CallbackQuery):
 
     for part in split_text(desc):
         await c.message.answer("📝 DESCRIPTION:\n```\n"+part+"\n```", parse_mode="Markdown")
-
     await c.answer()
 # =====================================
 
@@ -429,7 +418,7 @@ async def tags(c: CallbackQuery):
 # ================= MAIN ================
 async def main():
     dp.include_router(router)
-    print("🤖 BOT ISHLAYAPTI — TOP 10 VIEWCOUNT QO‘SHILDI")
+    print("🤖 BOT ISHLAYAPTI — START MATNI YANGILANDI")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
