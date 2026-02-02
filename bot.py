@@ -1,5 +1,5 @@
 import os, re, asyncio, requests
-from collections import Counter, defaultdict
+from collections import Counter
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
@@ -15,7 +15,7 @@ bot = Bot(
 )
 dp = Dispatcher()
 
-# ------------------ UTILS ------------------
+# ------------------ HELPERS ------------------
 def yt(endpoint, params):
     params["key"] = YOUTUBE_API_KEY
     r = requests.get(
@@ -33,35 +33,26 @@ def extract_video_id(url):
             return m.group(1)
     return None
 
-def clean_words(text):
+def words(text):
     return re.findall(r"[a-zA-Z]{3,}", text.lower())
 
-# ------------------ VIDEO TYPE DETECTION ------------------
-TYPE_KEYWORDS = {
-    "music": ["lyrics", "song", "remix", "audio", "music"],
-    "gaming": ["gameplay", "vs", "challenge", "beamng", "gaming"],
-    "review": ["review", "unboxing", "test"],
-    "education": ["how", "tutorial", "guide"],
-    "viral": ["short", "tiktok", "viral"],
-    "kids": ["kids", "children", "baby"]
-}
+# ------------------ TYPE DETECT ------------------
+def detect_type(title, desc):
+    t = f"{title} {desc}".lower()
 
-def detect_video_type(title, desc, competitor_titles):
-    score = defaultdict(int)
-    text = " ".join([title, desc] + competitor_titles).lower()
+    if any(x in t for x in ["beamng", "gameplay", "vs", "challenge"]):
+        return "gaming"
+    if any(x in t for x in ["lyrics", "song", "music"]):
+        return "music"
+    if any(x in t for x in ["cars", "mcqueen", "pixar", "toys", "unboxing"]):
+        return "entertainment"
+    if any(x in t for x in ["how to", "tutorial", "guide"]):
+        return "education"
 
-    for t, words in TYPE_KEYWORDS.items():
-        for w in words:
-            if w in text:
-                score[t] += 1
+    return "general"
 
-    if not score:
-        return "general"
-
-    return max(score, key=score.get)
-
-# ------------------ COMPETITOR ANALYSIS ------------------
-def get_competitor_titles(keyword):
+# ------------------ COMPETITOR TITLES ------------------
+def competitor_titles(keyword):
     data = yt("search", {
         "part": "snippet",
         "q": keyword,
@@ -70,65 +61,63 @@ def get_competitor_titles(keyword):
     })
     return [i["snippet"]["title"] for i in data.get("items", [])]
 
-def extract_patterns(titles):
-    words = []
+def strong_words(titles):
+    all_words = []
     for t in titles:
-        words.extend(clean_words(t))
-    return [w for w, _ in Counter(words).most_common(10)]
+        all_words += words(t)
+    return [w for w, _ in Counter(all_words).most_common(10)]
 
-# ------------------ TITLE GENERATOR ------------------
-def generate_titles(original, vtype, patterns):
-    base = original.split("|")[0].strip()
+# ------------------ TITLE AI ------------------
+def generate_titles(title, vtype, hot):
+    base = title.split("|")[0].strip()
 
-    if vtype == "music":
+    if vtype == "entertainment":
         return [
-            f"{base} | English Lyrics",
-            f"{base} | TikTok Viral Song",
-            f"{base} Lyrics (Trending)",
-            f"{base} | Emotional Version",
-            f"{base} Lyrics + Meaning"
+            f"{base} 😱 INSANE Result!",
+            f"{base} 🔥 You Won’t Believe This!",
+            f"{base} 🤯 CRAZY Experiment",
+            f"{base} 😲 Unexpected Outcome",
+            f"{base} 🚗 Most Satisfying Cars Moment"
         ]
 
     if vtype == "gaming":
         return [
-            f"{base} – INSANE Gameplay",
-            f"{base} | Unexpected Result",
-            f"{base} Challenge (SHOCKING)",
-            f"{base} vs Reality",
-            f"{base} | Viral Gameplay"
+            f"{base} 🎮 INSANE Gameplay",
+            f"{base} 💥 This Went Wrong",
+            f"{base} 🔥 CRAZY Experiment",
+            f"{base} 😱 Unexpected Result",
+            f"{base} 🚨 SHOCKING Ending"
         ]
 
-    if vtype == "review":
+    if vtype == "music":
         return [
-            f"{base} – Honest Review",
-            f"{base} | Is It Worth It?",
-            f"{base} Review After Testing",
-            f"{base} – Full Breakdown",
-            f"{base} | Pros & Cons"
+            f"{base} | English Lyrics",
+            f"{base} | TikTok Viral Version",
+            f"{base} | Emotional Version",
+            f"{base} Lyrics (Trending)",
+            f"{base} | Most Played Song"
         ]
 
     if vtype == "education":
         return [
             f"How to {base}",
             f"{base} Explained Simply",
-            f"{base} – Step by Step Guide",
-            f"Learn {base} in Minutes",
-            f"{base} Tutorial for Beginners"
+            f"{base} Step-by-Step Guide",
+            f"{base} for Beginners",
+            f"{base} Full Tutorial"
         ]
 
-    # GENERAL (dynamic)
     return [
-        f"{base} | {patterns[0].title()}",
-        f"{base} – {patterns[1].title()} Explained",
-        f"{base} | What You Need to Know",
-        f"{base} – Full Experience",
-        f"{base} | Trending Now"
+        f"{base} | {hot[0].title()}",
+        f"{base} – What Happened?",
+        f"{base} | Unexpected Moment",
+        f"{base} | Trending Now",
+        f"{base} – Full Experience"
     ]
 
-# ------------------ TAG GENERATOR ------------------
-def generate_tags(original, patterns):
-    base = clean_words(original)
-    tags = list(dict.fromkeys(base + patterns))
+# ------------------ TAG AI ------------------
+def generate_tags(title, hot):
+    tags = list(dict.fromkeys(words(title) + hot))
     return ", ".join(tags[:30])
 
 # ------------------ HANDLERS ------------------
@@ -137,10 +126,10 @@ async def start(msg: Message):
     await msg.answer(
         "👋 <b>Salom!</b>\n\n"
         "YouTube video linkini yuboring.\n"
-        "Men <b>har qanday video</b> uchun:\n"
+        "Men sizga:\n"
         "🧠 TOP NOMLAR\n"
         "🏷 TOP TAGLAR\n"
-        "ni real analiz asosida chiqaraman."
+        "ni real analiz asosida beraman."
     )
 
 @dp.message(F.text.startswith("http"))
@@ -152,28 +141,24 @@ async def handle_video(msg: Message):
 
     try:
         data = yt("videos", {"part": "snippet", "id": vid})["items"][0]
-    except Exception:
+    except:
         await msg.answer("❌ Video topilmadi.")
         return
 
     title = data["snippet"]["title"]
     desc = data["snippet"].get("description", "")
 
-    competitors = get_competitor_titles(title)
-    vtype = detect_video_type(title, desc, competitors)
-
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="🧠 TOP NOMLAR", callback_data=f"title:{vid}"),
-                InlineKeyboardButton(text="🏷 TOP TAGLAR", callback_data=f"tags:{vid}")
+                InlineKeyboardButton("🧠 TOP NOMLAR", callback_data=f"title:{vid}"),
+                InlineKeyboardButton("🏷 TOP TAGLAR", callback_data=f"tags:{vid}")
             ]
         ]
     )
 
     await msg.answer(
-        f"🎬 <b>{title}</b>\n"
-        f"📂 Aniqlangan tur: <b>{vtype.upper()}</b>\n\n"
+        f"🎬 <b>{title}</b>\n\n"
         "👇 Funksiyani tanlang:",
         reply_markup=kb
     )
@@ -186,11 +171,11 @@ async def cb_title(cb: CallbackQuery):
     title = data["snippet"]["title"]
     desc = data["snippet"].get("description", "")
 
-    competitors = get_competitor_titles(title)
-    patterns = extract_patterns(competitors)
-    vtype = detect_video_type(title, desc, competitors)
+    vtype = detect_type(title, desc)
+    comps = competitor_titles(title)
+    hot = strong_words(comps)
 
-    titles = generate_titles(title, vtype, patterns)
+    titles = generate_titles(title, vtype, hot)
 
     text = "🧠 <b>ANALIZ ASOSIDA TOP NOMLAR:</b>\n\n"
     for i, t in enumerate(titles, 1):
@@ -205,10 +190,10 @@ async def cb_tags(cb: CallbackQuery):
     data = yt("videos", {"part": "snippet", "id": vid})["items"][0]
 
     title = data["snippet"]["title"]
-    competitors = get_competitor_titles(title)
-    patterns = extract_patterns(competitors)
+    comps = competitor_titles(title)
+    hot = strong_words(comps)
 
-    tags = generate_tags(title, patterns)
+    tags = generate_tags(title, hot)
 
     await cb.message.answer(
         "🏷 <b>TOP TAGLAR (copy-paste):</b>\n\n"
@@ -218,7 +203,7 @@ async def cb_tags(cb: CallbackQuery):
 
 # ------------------ RUN ------------------
 async def main():
-    print("🤖 UNIVERSAL TEST BOT ishga tushdi")
+    print("🤖 TEST BOT ishga tushdi")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
