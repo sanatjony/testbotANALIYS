@@ -1,11 +1,17 @@
 import os, re, asyncio, requests
-from collections import Counter
+from collections import Counter, defaultdict
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.types import (
+    Message,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    CallbackQuery
+)
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 
+# ================== CONFIG ==================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 
@@ -15,7 +21,7 @@ bot = Bot(
 )
 dp = Dispatcher()
 
-# ------------------ HELPERS ------------------
+# ================== YOUTUBE API ==================
 def yt(endpoint, params):
     params["key"] = YOUTUBE_API_KEY
     r = requests.get(
@@ -33,16 +39,16 @@ def extract_video_id(url):
             return m.group(1)
     return None
 
-def words(text):
+def clean_words(text):
     return re.findall(r"[a-zA-Z]{3,}", text.lower())
 
-# ------------------ TYPE DETECT ------------------
-def detect_type(title, desc):
+# ================== VIDEO TYPE ==================
+def detect_video_type(title, desc):
     t = f"{title} {desc}".lower()
 
-    if any(x in t for x in ["beamng", "gameplay", "vs", "challenge"]):
+    if any(x in t for x in ["beamng", "gameplay", "vs", "challenge", "experiment"]):
         return "gaming"
-    if any(x in t for x in ["lyrics", "song", "music"]):
+    if any(x in t for x in ["lyrics", "song", "music", "tiktok"]):
         return "music"
     if any(x in t for x in ["cars", "mcqueen", "pixar", "toys", "unboxing"]):
         return "entertainment"
@@ -51,33 +57,40 @@ def detect_type(title, desc):
 
     return "general"
 
-# ------------------ COMPETITOR TITLES ------------------
-def competitor_titles(keyword):
+# ================== COMPETITOR ANALYSIS ==================
+def competitor_videos(keyword):
     data = yt("search", {
         "part": "snippet",
         "q": keyword,
         "type": "video",
-        "maxResults": 20
+        "maxResults": 25
     })
-    return [i["snippet"]["title"] for i in data.get("items", [])]
+    return data.get("items", [])
 
-def strong_words(titles):
-    all_words = []
-    for t in titles:
-        all_words += words(t)
-    return [w for w, _ in Counter(all_words).most_common(10)]
+def competitor_channels(videos):
+    channels = defaultdict(int)
+    for v in videos:
+        ch = v["snippet"]["channelTitle"]
+        channels[ch] += 1
+    return sorted(channels.items(), key=lambda x: x[1], reverse=True)[:5]
 
-# ------------------ TITLE AI ------------------
-def generate_titles(title, vtype, hot):
-    base = title.split("|")[0].strip()
+def hot_keywords(videos):
+    words = []
+    for v in videos:
+        words += clean_words(v["snippet"]["title"])
+    return [w for w, _ in Counter(words).most_common(12)]
+
+# ================== AI TITLE LOGIC ==================
+def generate_titles(base_title, vtype, hot):
+    base = base_title.split("|")[0].strip()
 
     if vtype == "entertainment":
         return [
             f"{base} 😱 INSANE Result!",
             f"{base} 🔥 You Won’t Believe This!",
-            f"{base} 🤯 CRAZY Experiment",
+            f"{base} 🤯 CRAZY Cars Moment",
             f"{base} 😲 Unexpected Outcome",
-            f"{base} 🚗 Most Satisfying Cars Moment"
+            f"{base} 🚗 Most Satisfying Cars Video"
         ]
 
     if vtype == "gaming":
@@ -98,38 +111,30 @@ def generate_titles(title, vtype, hot):
             f"{base} | Most Played Song"
         ]
 
-    if vtype == "education":
-        return [
-            f"How to {base}",
-            f"{base} Explained Simply",
-            f"{base} Step-by-Step Guide",
-            f"{base} for Beginners",
-            f"{base} Full Tutorial"
-        ]
-
     return [
-        f"{base} | {hot[0].title()}",
+        f"{base} | Trending Now",
         f"{base} – What Happened?",
         f"{base} | Unexpected Moment",
-        f"{base} | Trending Now",
+        f"{base} | Viral Video",
         f"{base} – Full Experience"
     ]
 
-# ------------------ TAG AI ------------------
+# ================== AI TAG LOGIC ==================
 def generate_tags(title, hot):
-    tags = list(dict.fromkeys(words(title) + hot))
+    tags = list(dict.fromkeys(clean_words(title) + hot))
     return ", ".join(tags[:30])
 
-# ------------------ HANDLERS ------------------
+# ================== HANDLERS ==================
 @dp.message(F.text == "/start")
 async def start(msg: Message):
     await msg.answer(
         "👋 <b>Salom!</b>\n\n"
-        "YouTube video linkini yuboring.\n"
+        "YouTube video linkini yuboring.\n\n"
         "Men sizga:\n"
         "🧠 TOP NOMLAR\n"
         "🏷 TOP TAGLAR\n"
-        "ni real analiz asosida beraman."
+        "📊 Raqobatchi kanallar\n"
+        "ni analiz qilib beraman."
     )
 
 @dp.message(F.text.startswith("http"))
@@ -140,29 +145,47 @@ async def handle_video(msg: Message):
         return
 
     try:
-        data = yt("videos", {"part": "snippet", "id": vid})["items"][0]
+        data = yt("videos", {"part": "snippet,statistics", "id": vid})["items"][0]
     except:
-        await msg.answer("❌ Video topilmadi.")
+        await msg.answer("❌ Video topilmadi yoki API cheklangan.")
         return
 
     title = data["snippet"]["title"]
-    desc = data["snippet"].get("description", "")
+    views = data["statistics"].get("viewCount", "—")
+    likes = data["statistics"].get("likeCount", "—")
+    comments = data["statistics"].get("commentCount", "—")
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton("🧠 TOP NOMLAR", callback_data=f"title:{vid}"),
-                InlineKeyboardButton("🏷 TOP TAGLAR", callback_data=f"tags:{vid}")
+                InlineKeyboardButton(
+                    text="🧠 TOP NOMLAR",
+                    callback_data=f"title:{vid}"
+                ),
+                InlineKeyboardButton(
+                    text="🏷 TOP TAGLAR",
+                    callback_data=f"tags:{vid}"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📊 Raqobatchi kanallar",
+                    callback_data=f"comp:{vid}"
+                )
             ]
         ]
     )
 
     await msg.answer(
         f"🎬 <b>{title}</b>\n\n"
-        "👇 Funksiyani tanlang:",
+        f"👁 View: {views}\n"
+        f"👍 Like: {likes}\n"
+        f"💬 Comment: {comments}\n\n"
+        "👇 Kerakli funksiyani tanlang:",
         reply_markup=kb
     )
 
+# ================== CALLBACKS ==================
 @dp.callback_query(F.data.startswith("title:"))
 async def cb_title(cb: CallbackQuery):
     vid = cb.data.split(":")[1]
@@ -171,9 +194,9 @@ async def cb_title(cb: CallbackQuery):
     title = data["snippet"]["title"]
     desc = data["snippet"].get("description", "")
 
-    vtype = detect_type(title, desc)
-    comps = competitor_titles(title)
-    hot = strong_words(comps)
+    vtype = detect_video_type(title, desc)
+    videos = competitor_videos(title)
+    hot = hot_keywords(videos)
 
     titles = generate_titles(title, vtype, hot)
 
@@ -190,18 +213,34 @@ async def cb_tags(cb: CallbackQuery):
     data = yt("videos", {"part": "snippet", "id": vid})["items"][0]
 
     title = data["snippet"]["title"]
-    comps = competitor_titles(title)
-    hot = strong_words(comps)
+    videos = competitor_videos(title)
+    hot = hot_keywords(videos)
 
     tags = generate_tags(title, hot)
 
     await cb.message.answer(
-        "🏷 <b>TOP TAGLAR (copy-paste):</b>\n\n"
+        "🏷 <b>TOP TAGLAR (copy–paste):</b>\n\n"
         f"<code>{tags}</code>"
     )
     await cb.answer()
 
-# ------------------ RUN ------------------
+@dp.callback_query(F.data.startswith("comp:"))
+async def cb_comp(cb: CallbackQuery):
+    vid = cb.data.split(":")[1]
+    data = yt("videos", {"part": "snippet", "id": vid})["items"][0]
+
+    title = data["snippet"]["title"]
+    videos = competitor_videos(title)
+    channels = competitor_channels(videos)
+
+    text = "📊 <b>Raqobatchi kanallar (TOP):</b>\n\n"
+    for i, (ch, cnt) in enumerate(channels, 1):
+        text += f"{i}. {ch} — o‘xshash video: {cnt}\n"
+
+    await cb.message.answer(text)
+    await cb.answer()
+
+# ================== RUN ==================
 async def main():
     print("🤖 TEST BOT ishga tushdi")
     await dp.start_polling(bot)
