@@ -3,9 +3,19 @@ import re
 import asyncio
 import requests
 from collections import Counter, defaultdict
+from datetime import datetime
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+from pytrends.request import TrendReq
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.types import (
+    Message, InlineKeyboardMarkup, InlineKeyboardButton,
+    CallbackQuery, FSInputFile
+)
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 
@@ -19,6 +29,8 @@ bot = Bot(
     default=DefaultBotProperties(parse_mode=ParseMode.HTML)
 )
 dp = Dispatcher()
+
+pytrends = TrendReq(hl="en-US", tz=360)
 
 # ================== UTILS ==================
 
@@ -47,7 +59,6 @@ def build_phrases(words, n):
         for i in range(len(words) - n + 1)
     ]
 
-
 # ================== YOUTUBE API ==================
 
 def yt_video(video_id: str):
@@ -57,14 +68,13 @@ def yt_video(video_id: str):
         "part": "snippet,statistics",
         "id": video_id
     }
-
     try:
         r = requests.get(url, params=params, timeout=10)
         data = r.json()
     except Exception:
         return None
 
-    if "items" not in data or not data["items"]:
+    if not data.get("items"):
         return None
 
     return data["items"][0]
@@ -79,13 +89,11 @@ def yt_search(query: str, max_results=30):
         "type": "video",
         "maxResults": max_results
     }
-
     try:
         r = requests.get(url, params=params, timeout=10)
         return r.json().get("items", [])
     except Exception:
         return []
-
 
 # ================== AI CORE ==================
 
@@ -100,28 +108,22 @@ def ai_semantic_tags(base_title: str):
     phrases = build_phrases(pool, 2) + build_phrases(pool, 3)
     counter = Counter(phrases)
 
-    tags = [p for p, _ in counter.most_common(30)]
-    return tags[:25]
+    return [p for p, _ in counter.most_common(25)]
 
 
 def ai_titles(base_title: str, tags: list[str]):
     base = base_title.split("|")[0].strip()
-
     hooks = [
         "INSANE",
         "You Won’t Believe",
         "Unexpected",
         "Extreme Test",
-        "People Are Shocked By",
-        "This Changed Everything"
+        "People Are Shocked By"
     ]
 
     titles = []
     for h in hooks:
         titles.append(f"{h} {base} | {tags[0].title()}")
-        if len(titles) == 5:
-            break
-
     return titles
 
 
@@ -136,11 +138,33 @@ def competitor_analysis(base_title: str):
 
     text = "🧲 <b>Raqobatchi kanallar (TOP)</b>\n\n"
     for i, (ch, count) in enumerate(ranked[:5], 1):
-        text += f"{i}️⃣ <b>{ch}</b>\n📹 O‘xshash videolar: {count}\n\n"
+        text += f"{i}️⃣ <b>{ch}</b>\n📹 O‘xshash video: {count}\n\n"
 
-    text += "📌 <i>Ko‘p chiqayotgan kanallar — real raqobatchilar</i>"
     return text
 
+# ================== GLOBAL TREND ==================
+
+def build_trend(keyword: str):
+    pytrends.build_payload([keyword], timeframe="today 3-m")
+    df = pytrends.interest_over_time()
+
+    if df.empty:
+        return None, None
+
+    values = df[keyword]
+    trend_status = "🟢 O‘sish" if values.iloc[-1] > values.mean() else "🟡 Barqaror"
+
+    # grafik
+    plt.figure(figsize=(7, 3))
+    plt.plot(df.index, values)
+    plt.title(f"Global trend: {keyword}")
+    plt.tight_layout()
+
+    filename = f"/tmp/trend_{int(datetime.now().timestamp())}.png"
+    plt.savefig(filename)
+    plt.close()
+
+    return filename, trend_status
 
 # ================== HANDLERS ==================
 
@@ -152,7 +176,8 @@ async def start_cmd(message: Message):
         "Men sizga:\n"
         "• 🧠 TOP NOMLAR\n"
         "• 🏷 TOP TAGLAR\n"
-        "• 🧲 Raqobatchi analiz\n\n"
+        "• 🧲 Raqobatchi analiz\n"
+        "• 📈 Global trend\n\n"
         "chiqarib beraman."
     )
 
@@ -160,9 +185,8 @@ async def start_cmd(message: Message):
 @dp.message(F.text.startswith("http"))
 async def handle_video(message: Message):
     vid = extract_video_id(message.text)
-
     if not vid:
-        await message.answer("❌ YouTube video ID topilmadi.")
+        await message.answer("❌ YouTube link noto‘g‘ri.")
         return
 
     info = yt_video(vid)
@@ -179,71 +203,52 @@ async def handle_video(message: Message):
             InlineKeyboardButton(text="🏷 TOP TAGLAR", callback_data=f"tags:{vid}")
         ],
         [
-            InlineKeyboardButton(text="🧲 Raqobatchi analiz", callback_data=f"comp:{vid}")
+            InlineKeyboardButton(text="🧲 Raqobatchi analiz", callback_data=f"comp:{vid}"),
+            InlineKeyboardButton(text="📈 Global trend", callback_data=f"trend:{vid}")
         ]
     ])
 
     await message.answer(
         f"🎬 <b>Mavjud video nomi:</b>\n{title}\n\n"
         f"📺 <b>Kanal:</b> {channel}\n\n"
-        "👇 Kerakli funksiyani tanlang",
+        "👇 Funksiyani tanlang:",
         reply_markup=kb
     )
 
 
-@dp.callback_query(F.data.startswith("tags:"))
-async def cb_tags(cb: CallbackQuery):
+@dp.callback_query(F.data.startswith("trend:"))
+async def cb_trend(cb: CallbackQuery):
     vid = cb.data.split(":")[1]
     info = yt_video(vid)
 
     if not info:
-        await cb.message.answer("❌ TOP taglarni olishda xatolik.")
+        await cb.message.answer("❌ Trendni olishda xatolik.")
         await cb.answer()
         return
 
-    tags = ai_semantic_tags(info["snippet"]["title"])
+    keyword = info["snippet"]["title"].split("|")[0].strip()
+    await cb.message.answer("📈 Global trend olinmoqda, biroz kuting...")
 
-    await cb.message.answer(
-        "🏷 <b>TOP TAGLAR (AI tavsiyasi)</b>\n\n"
-        "<code>" + ", ".join(tags) + "</code>\n\n"
-        "📈 CTR + Search uchun mos"
-    )
-    await cb.answer()
-
-
-@dp.callback_query(F.data.startswith("title:"))
-async def cb_titles(cb: CallbackQuery):
-    vid = cb.data.split(":")[1]
-    info = yt_video(vid)
-
-    if not info:
-        await cb.message.answer("❌ TOP nomlarni generatsiyada xatolik.")
+    try:
+        img, status = build_trend(keyword)
+    except Exception:
+        await cb.message.answer("❌ Trend ma’lumot topilmadi.")
         await cb.answer()
         return
 
-    tags = ai_semantic_tags(info["snippet"]["title"])
-    titles = ai_titles(info["snippet"]["title"], tags)
-
-    text = "🧠 <b>TOP NOMLAR (AI tavsiyasi)</b>\n\n"
-    for i, t in enumerate(titles, 1):
-        text += f"{i}. {t}\n"
-
-    await cb.message.answer(text)
-    await cb.answer()
-
-
-@dp.callback_query(F.data.startswith("comp:"))
-async def cb_comp(cb: CallbackQuery):
-    vid = cb.data.split(":")[1]
-    info = yt_video(vid)
-
-    if not info:
-        await cb.message.answer("❌ Raqobatchi analizida xatolik.")
+    if not img:
+        await cb.message.answer("❌ Trend ma’lumot topilmadi.")
         await cb.answer()
         return
 
-    await cb.message.answer(
-        competitor_analysis(info["snippet"]["title"])
+    await cb.message.answer_photo(
+        photo=FSInputFile(img),
+        caption=(
+            f"📈 <b>Global trend</b>\n\n"
+            f"🔑 Keyword: <b>{keyword}</b>\n"
+            f"🕒 Oxirgi 3 oy\n"
+            f"📊 Natija: {status}"
+        )
     )
     await cb.answer()
 
