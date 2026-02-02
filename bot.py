@@ -12,7 +12,7 @@ from aiogram.client.default import DefaultBotProperties
 # ================== CONFIG ==================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-YT_API_KEY = os.getenv("YT_API_KEY")
+YT_API_KEY = os.getenv("YOUTUBE_API_KEY")
 
 bot = Bot(
     token=BOT_TOKEN,
@@ -22,7 +22,7 @@ dp = Dispatcher()
 
 # ================== UTILS ==================
 
-def extract_video_id(url: str) -> str | None:
+def extract_video_id(url: str):
     patterns = [
         r"v=([a-zA-Z0-9_-]{11})",
         r"youtu\.be/([a-zA-Z0-9_-]{11})",
@@ -150,8 +150,8 @@ async def start_cmd(message: Message):
         "👋 <b>Salom!</b>\n\n"
         "🔗 YouTube video havolasini yuboring.\n\n"
         "Men sizga:\n"
-        "• 🧠 AI Title\n"
-        "• 🏷 AI Tags\n"
+        "• 🧠 TOP NOMLAR\n"
+        "• 🏷 TOP TAGLAR\n"
         "• 🧲 Raqobatchi analiz\n\n"
         "chiqarib beraman."
     )
@@ -175,11 +175,11 @@ async def handle_video(message: Message):
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="🧠 AI Title", callback_data=f"title:{vid}"),
-            InlineKeyboardButton(text="🏷 AI Tags", callback_data=f"tags:{vid}")
+            InlineKeyboardButton(text="🧠 TOP NOMLAR", callback_data=f"title:{vid}"),
+            InlineKeyboardButton(text="🏷 TOP TAGLAR", callback_data=f"tags:{vid}")
         ],
         [
-            InlineKeyboardButton(text="🧲 Raqobat", callback_data=f"comp:{vid}")
+            InlineKeyboardButton(text="🧲 Raqobatchi analiz", callback_data=f"comp:{vid}")
         ]
     ])
 
@@ -197,14 +197,14 @@ async def cb_tags(cb: CallbackQuery):
     info = yt_video(vid)
 
     if not info:
-        await cb.message.answer("❌ Taglar olishda xatolik.")
+        await cb.message.answer("❌ TOP taglarni olishda xatolik.")
         await cb.answer()
         return
 
     tags = ai_semantic_tags(info["snippet"]["title"])
 
     await cb.message.answer(
-        "🏷 <b>AI tavsiya qilgan TOP TAGLAR</b>\n\n"
+        "🏷 <b>TOP TAGLAR (AI tavsiyasi)</b>\n\n"
         "<code>" + ", ".join(tags) + "</code>\n\n"
         "📈 CTR + Search uchun mos"
     )
@@ -217,14 +217,14 @@ async def cb_titles(cb: CallbackQuery):
     info = yt_video(vid)
 
     if not info:
-        await cb.message.answer("❌ Title generatsiyada xatolik.")
+        await cb.message.answer("❌ TOP nomlarni generatsiyada xatolik.")
         await cb.answer()
         return
 
     tags = ai_semantic_tags(info["snippet"]["title"])
     titles = ai_titles(info["snippet"]["title"], tags)
 
-    text = "🧠 <b>AI tavsiya qilgan CLICKBAIT TITLAR</b>\n\n"
+    text = "🧠 <b>TOP NOMLAR (AI tavsiyasi)</b>\n\n"
     for i, t in enumerate(titles, 1):
         text += f"{i}. {t}\n"
 
@@ -251,7 +251,7 @@ async def cb_comp(cb: CallbackQuery):
 # ================== START ==================
 
 async def main():
-    print("🤖 Test bot ishga tushdi")
+    print("🤖 TEST BOT ishga tushdi")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
