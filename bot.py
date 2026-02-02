@@ -1,18 +1,18 @@
 import os
 import re
 import asyncio
-from datetime import datetime, timedelta
-
+import requests
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import (
+    Message,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    CallbackQuery,
+)
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 
-import requests
-from pytrends.request import TrendReq
-import matplotlib.pyplot as plt
-
-# ================== CONFIG ==================
+# ================= CONFIG =================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 
@@ -22,12 +22,12 @@ bot = Bot(
 )
 dp = Dispatcher()
 
-# ================== UTILS ==================
+# ================= UTILS =================
 def extract_video_id(url: str):
     patterns = [
         r"v=([^&]+)",
         r"youtu\.be/([^?]+)",
-        r"youtube\.com/shorts/([^?]+)"
+        r"youtube\.com/shorts/([^?]+)",
     ]
     for p in patterns:
         m = re.search(p, url)
@@ -41,72 +41,99 @@ def yt_api(endpoint, params):
     r = requests.get(
         f"https://www.googleapis.com/youtube/v3/{endpoint}",
         params=params,
-        timeout=10
+        timeout=8
     )
     r.raise_for_status()
     return r.json()
 
 
-# ================== AI LOGIC ==================
-def generate_titles(title: str):
+# ================= AI LOGIC =================
+def ai_titles(title: str):
     base = title.split("|")[0].strip()
     return [
         f"{base} 😱 INSANE Result!",
         f"{base} 🔥 You Won’t Believe This",
-        f"{base} 💥 CRAZY Experiment",
+        f"{base} 💥 CRAZY Moment",
         f"{base} ⚠️ Unexpected Outcome",
-        f"{base} 🚛 SHOCKING Gameplay"
+        f"{base} 🚀 SHOCKING Video",
     ]
 
 
-def generate_tags(title: str):
-    title = title.lower()
+def ai_tags(title: str):
+    t = title.lower()
     tags = set()
 
-    if "mcqueen" in title or "cars" in title:
+    if "mcqueen" in t or "cars" in t:
         tags |= {
             "pixar cars", "lightning mcqueen", "disney cars",
-            "cars toys", "mcqueen gameplay"
+            "cars toys", "mcqueen video"
         }
 
-    if "truck" in title:
+    if "truck" in t:
         tags |= {
-            "flatbed truck", "truck challenge", "truck experiment",
-            "truck gameplay", "transportation truck"
+            "flatbed truck", "truck challenge",
+            "truck experiment", "truck gameplay"
+        }
+
+    if "lyrics" in t or "song" in t:
+        tags |= {
+            "viral song", "tiktok song", "english lyrics",
+            "lyrics video", "viral music"
         }
 
     tags |= {
-        "beamng drive", "beamng gameplay", "beamng mods",
-        "viral gameplay", "satisfying gameplay", "simulation game"
+        "viral video", "youtube shorts",
+        "trending video", "popular video"
     }
 
     return ", ".join(sorted(tags))
 
 
-# ================== TREND (1 OY) ==================
-def build_trend_chart(keyword: str):
-    pytrends = TrendReq(hl="en-US", tz=0)
-    pytrends.build_payload(
-        [keyword],
-        timeframe="today 1-m"
+def global_trend_score(title: str):
+    """
+    Grafik yo‘q.
+    Tezkor baho (heuristic).
+    """
+    score = 0
+    t = title.lower()
+
+    if "viral" in t or "tiktok" in t:
+        score += 2
+    if "mcqueen" in t or "cars" in t:
+        score += 1
+    if "lyrics" in t:
+        score += 1
+
+    if score >= 3:
+        return "🟢 O‘sishda"
+    elif score == 2:
+        return "🟡 Barqaror"
+    else:
+        return "🔴 Past"
+
+
+def competitor_analysis(keyword: str):
+    data = yt_api(
+        "search",
+        {
+            "part": "snippet",
+            "q": keyword,
+            "type": "video",
+            "maxResults": 25,
+        }
     )
-    data = pytrends.interest_over_time()
 
-    if data.empty:
-        return None
+    channels = set()
+    for item in data.get("items", []):
+        channels.add(item["snippet"]["channelTitle"])
 
-    plt.figure(figsize=(6, 3))
-    plt.plot(data.index, data[keyword])
-    plt.title(f"Global trend (1 oy): {keyword}")
-    plt.tight_layout()
-
-    file_path = f"/tmp/trend_{keyword.replace(' ', '_')}.png"
-    plt.savefig(file_path)
-    plt.close()
-    return file_path
+    return {
+        "videos": len(data.get("items", [])),
+        "channels": len(channels),
+    }
 
 
-# ================== HANDLERS ==================
+# ================= HANDLERS =================
 @dp.message(F.text == "/start")
 async def start(msg: Message):
     await msg.answer(
@@ -115,6 +142,7 @@ async def start(msg: Message):
         "Men sizga:\n"
         "🧠 <b>TOP NOMLAR</b>\n"
         "🏷 <b>TOP TAGLAR</b>\n"
+        "📊 <b>Raqobat analizi</b>\n"
         "📈 <b>Global trend (1 oy)</b>\n\n"
         "chiqarib beraman."
     )
@@ -124,33 +152,27 @@ async def start(msg: Message):
 async def handle_video(msg: Message):
     video_id = extract_video_id(msg.text)
     if not video_id:
-        await msg.answer("❌ Video ID topilmadi.")
+        await msg.answer("❌ Video havolasi noto‘g‘ri.")
         return
 
     try:
         video = yt_api(
             "videos",
-            {
-                "part": "snippet,statistics",
-                "id": video_id
-            }
+            {"part": "snippet,statistics", "id": video_id}
         )["items"][0]
     except Exception:
         await msg.answer("❌ Video topilmadi yoki API cheklangan.")
         return
 
-    snippet = video["snippet"]
-    stats = video["statistics"]
-
-    title = snippet["title"]
-    channel = snippet["channelTitle"]
+    s = video["snippet"]
+    st = video["statistics"]
 
     text = (
-        f"🎬 <b>{title}</b>\n"
-        f"📺 Kanal: <b>{channel}</b>\n\n"
-        f"👁 View: {stats.get('viewCount','-')}\n"
-        f"👍 Like: {stats.get('likeCount','-')}\n"
-        f"💬 Comment: {stats.get('commentCount','-')}\n\n"
+        f"🎬 <b>{s['title']}</b>\n"
+        f"📺 Kanal: <b>{s['channelTitle']}</b>\n\n"
+        f"👁 View: {st.get('viewCount','-')}\n"
+        f"👍 Like: {st.get('likeCount','-')}\n"
+        f"💬 Comment: {st.get('commentCount','-')}\n\n"
         "👇 <b>Kerakli funksiyani tanlang:</b>"
     )
 
@@ -168,10 +190,14 @@ async def handle_video(msg: Message):
             ],
             [
                 InlineKeyboardButton(
-                    text="📈 Global trend (1 oy)",
+                    text="📊 Raqobat",
+                    callback_data=f"comp:{video_id}"
+                ),
+                InlineKeyboardButton(
+                    text="📈 Global trend",
                     callback_data=f"trend:{video_id}"
-                )
-            ]
+                ),
+            ],
         ]
     )
 
@@ -179,14 +205,11 @@ async def handle_video(msg: Message):
 
 
 @dp.callback_query(F.data.startswith("title:"))
-async def cb_title(cb):
-    video_id = cb.data.split(":")[1]
-    video = yt_api(
-        "videos",
-        {"part": "snippet", "id": video_id}
-    )["items"][0]
+async def cb_title(cb: CallbackQuery):
+    vid = cb.data.split(":")[1]
+    video = yt_api("videos", {"part": "snippet", "id": vid})["items"][0]
+    titles = ai_titles(video["snippet"]["title"])
 
-    titles = generate_titles(video["snippet"]["title"])
     text = "<b>🧠 TOP CLICKBAIT NOMLAR:</b>\n\n"
     for i, t in enumerate(titles, 1):
         text += f"{i}. {t}\n"
@@ -195,14 +218,11 @@ async def cb_title(cb):
 
 
 @dp.callback_query(F.data.startswith("tags:"))
-async def cb_tags(cb):
-    video_id = cb.data.split(":")[1]
-    video = yt_api(
-        "videos",
-        {"part": "snippet", "id": video_id}
-    )["items"][0]
+async def cb_tags(cb: CallbackQuery):
+    vid = cb.data.split(":")[1]
+    video = yt_api("videos", {"part": "snippet", "id": vid})["items"][0]
+    tags = ai_tags(video["snippet"]["title"])
 
-    tags = generate_tags(video["snippet"]["title"])
     await cb.message.answer(
         "<b>🏷 TOP TAGLAR (copy-paste):</b>\n\n"
         f"<code>{tags}</code>"
@@ -210,29 +230,38 @@ async def cb_tags(cb):
 
 
 @dp.callback_query(F.data.startswith("trend:"))
-async def cb_trend(cb):
-    await cb.message.answer("📈 Global trend olinmoqda (1 oy), biroz kuting...")
+async def cb_trend(cb: CallbackQuery):
+    vid = cb.data.split(":")[1]
+    video = yt_api("videos", {"part": "snippet", "id": vid})["items"][0]
+    title = video["snippet"]["title"]
 
-    video_id = cb.data.split(":")[1]
-    video = yt_api(
-        "videos",
-        {"part": "snippet", "id": video_id}
-    )["items"][0]
-
-    keyword = video["snippet"]["title"].split("|")[0].strip()
-
-    path = await asyncio.to_thread(build_trend_chart, keyword)
-    if not path:
-        await cb.message.answer("❌ Trend ma’lumot topilmadi.")
-        return
-
-    await cb.message.answer_photo(
-        photo=open(path, "rb"),
-        caption=f"📈 <b>Global trend (1 oy)</b>\n🔑 Keyword: <b>{keyword}</b>"
+    result = global_trend_score(title)
+    await cb.message.answer(
+        f"📈 <b>Global trend (1 oy)</b>\n"
+        f"🔑 Keyword: <b>{title.split('|')[0]}</b>\n"
+        f"📊 Natija: {result}"
     )
 
 
-# ================== RUN ==================
+@dp.callback_query(F.data.startswith("comp:"))
+async def cb_comp(cb: CallbackQuery):
+    vid = cb.data.split(":")[1]
+    video = yt_api("videos", {"part": "snippet", "id": vid})["items"][0]
+    keyword = video["snippet"]["title"].split("|")[0]
+
+    data = await asyncio.to_thread(competitor_analysis, keyword)
+
+    await cb.message.answer(
+        "📊 <b>Raqobat (YouTube Search)</b>\n\n"
+        f"🔑 Keyword: <b>{keyword}</b>\n"
+        f"🎬 Top videolar: {data['videos']}\n"
+        f"📺 Turli kanallar: {data['channels']}\n\n"
+        f"📌 Xulosa: "
+        f"{'🔴 Raqobat yuqori' if data['channels'] > 10 else '🟢 Raqobat past'}"
+    )
+
+
+# ================= RUN =================
 async def main():
     print("🤖 TEST BOT ishga tushdi")
     await dp.start_polling(bot)
