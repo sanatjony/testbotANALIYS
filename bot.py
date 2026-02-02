@@ -1,13 +1,13 @@
 import os, re, asyncio, requests
+from datetime import datetime, timedelta
 from difflib import SequenceMatcher
-from collections import Counter
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 
-# ================= CONFIG =================
+# ================== CONFIG ==================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 
@@ -17,13 +17,13 @@ bot = Bot(
 )
 dp = Dispatcher()
 
-# ================= YOUTUBE API =================
+# ================== YOUTUBE API ==================
 def yt(endpoint, params):
     params["key"] = YOUTUBE_API_KEY
     r = requests.get(
         f"https://www.googleapis.com/youtube/v3/{endpoint}",
         params=params,
-        timeout=8
+        timeout=10
     )
     r.raise_for_status()
     return r.json()
@@ -35,112 +35,71 @@ def extract_video_id(url):
             return m.group(1)
     return None
 
-# ================= TEXT UTILS =================
+# ================== TEXT UTILS ==================
 def similarity(a, b):
     return SequenceMatcher(None, a.lower(), b.lower()).ratio()
 
-def clean(t):
-    return re.sub(r"[^\w\s]", "", t).strip()
+def clean(text):
+    return re.sub(r"[^\w\s]", "", text).strip()
 
-def words(t):
-    return re.findall(r"[a-zA-Z]{3,}", t.lower())
+# ================== DATE ==================
+def is_last_30_days(published):
+    published_date = datetime.strptime(published, "%Y-%m-%dT%H:%M:%SZ")
+    return published_date >= datetime.utcnow() - timedelta(days=30)
 
-# ================= VIDEO TYPE =================
-def detect_type(title):
-    t = title.lower()
-    if any(x in t for x in ["beamng", "gameplay", "vs", "challenge", "experiment"]):
-        return "gaming"
-    if any(x in t for x in ["unboxing", "review", "toys", "cars", "mcqueen", "pixar"]):
-        return "unboxing"
-    if any(x in t for x in ["lyrics", "song", "music"]):
-        return "music"
-    return "general"
-
-# ================= SEARCH =================
-def search_titles(keyword):
-    data = yt("search", {
+# ================== MAIN LOGIC ==================
+def get_competitor_top_titles(keyword):
+    search = yt("search", {
         "part": "snippet",
         "q": keyword,
         "type": "video",
-        "maxResults": 25
+        "order": "viewCount",
+        "maxResults": 50
     })
-    return [v["snippet"]["title"] for v in data.get("items", [])]
 
-# ================= FALLBACK CTR TITLES =================
-def fallback_titles(base, vtype):
-    if vtype == "unboxing":
-        return [
-            f"{base} – Is It Really Worth It?",
-            f"I Tested {base} – Here’s What Happened",
-            f"{base} Review After Real Use",
-            f"{base} – Honest Review (No Hype)",
-            f"{base} – Pros & Cons Explained"
-        ]
+    titles = []
 
-    if vtype == "gaming":
-        return [
-            f"{base} – This Went Wrong",
-            f"I Tried This in {base}…",
-            f"{base} – Unexpected Result",
-            f"{base} Gameplay That Shocked Me",
-            f"{base} – Worst vs Best Moment"
-        ]
+    for item in search.get("items", []):
+        vid = item["id"]["videoId"]
+        snippet = item["snippet"]
 
-    if vtype == "music":
-        return [
-            f"{base} | English Lyrics",
-            f"{base} | Viral TikTok Version",
-            f"{base} – Emotional Version",
-            f"{base} Lyrics Everyone Is Searching For",
-            f"{base} | Most Played Song"
-        ]
-
-    return [
-        f"{base} – What Happened?",
-        f"{base} – Nobody Expected This",
-        f"{base} – Full Breakdown",
-        f"{base} – The Truth",
-        f"{base} – Explained"
-    ]
-
-# ================= MAIN TITLE GENERATOR =================
-def generate_top_titles(original_title):
-    base = clean(original_title)
-    vtype = detect_type(base)
-
-    search_results = search_titles(base)
-    results = []
-
-    for t in search_results:
-        ct = clean(t)
-
-        if similarity(base, ct) > 0.92:
+        if not is_last_30_days(snippet["publishedAt"]):
             continue
 
-        if len(ct) > 75:
-            ct = ct[:72] + "..."
+        video_data = yt("videos", {
+            "part": "statistics,snippet",
+            "id": vid
+        })["items"]
 
-        if all(similarity(ct, r) < 0.8 for r in results):
-            results.append(ct)
+        if not video_data:
+            continue
 
-        if len(results) >= 5:
+        views = int(video_data[0]["statistics"].get("viewCount", 0))
+        if views < 1000:
+            continue
+
+        title = clean(video_data[0]["snippet"]["title"])
+
+        # DUPLICATE CHECK
+        if any(similarity(title, t) > 0.9 for t in titles):
+            continue
+
+        titles.append(title)
+
+        if len(titles) >= 10:
             break
 
-    # FALLBACK
-    if len(results) < 3:
-        results = fallback_titles(base, vtype)
+    return titles
 
-    return results
-
-# ================= HANDLERS =================
+# ================== HANDLERS ==================
 @dp.message(F.text == "/start")
 async def start(msg: Message):
     await msg.answer(
         "👋 <b>Salom!</b>\n\n"
         "YouTube video havolasini yuboring.\n\n"
-        "🧠 TOP NOMLAR — YouTube search + analiz\n"
-        "🏷 CTR oshiruvchi nomlar\n"
-        "❌ Qotmaydi, ❌ topilmadi chiqmaydi"
+        "🧠 TOP NOMLAR — konkurent kanallar analizi\n"
+        "📊 Oxirgi 30 kun + eng ko‘p ko‘rilgan\n"
+        "❌ Random emas, REAL"
     )
 
 @dp.message(F.text.startswith("http"))
@@ -162,8 +121,8 @@ async def handle_video(msg: Message):
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🧠 TOP NOMLAR",
-                    callback_data=f"title:{vid}"
+                    text="🧠 TOP NOMLAR (Konkurent)",
+                    callback_data=f"top:{vid}"
                 )
             ]
         ]
@@ -171,26 +130,33 @@ async def handle_video(msg: Message):
 
     await msg.answer(
         f"🎬 <b>{title}</b>\n\n"
-        "👇 TOP NOMLARNI olish uchun bosing:",
+        "👇 Konkurentlar asosida TOP nomlarni olish:",
         reply_markup=kb
     )
 
-# ================= CALLBACK =================
-@dp.callback_query(F.data.startswith("title:"))
-async def cb_title(cb: CallbackQuery):
+# ================== CALLBACK ==================
+@dp.callback_query(F.data.startswith("top:"))
+async def cb_top(cb: CallbackQuery):
     vid = cb.data.split(":")[1]
+
     data = yt("videos", {"part": "snippet", "id": vid})["items"][0]
+    base_title = clean(data["snippet"]["title"])
 
-    titles = generate_top_titles(data["snippet"]["title"])
+    titles = get_competitor_top_titles(base_title)
 
-    text = "🧠 <b>ANALIZ ASOSIDA TOP NOMLAR:</b>\n\n"
+    if not titles:
+        await cb.message.answer("⚠️ Konkurentlardan yetarli ma’lumot topilmadi.")
+        await cb.answer()
+        return
+
+    text = "🧠 <b>OXIRGI 30 KUN — KONKURENTLAR TOP NOMLARI:</b>\n\n"
     for i, t in enumerate(titles, 1):
         text += f"{i}. {t}\n"
 
     await cb.message.answer(text)
     await cb.answer()
 
-# ================= RUN =================
+# ================== RUN ==================
 async def main():
     print("🤖 TEST BOT ishga tushdi")
     await dp.start_polling(bot)
