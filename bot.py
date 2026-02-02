@@ -4,7 +4,7 @@ import sqlite3
 import time
 import os
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
@@ -105,31 +105,24 @@ def yt_api(endpoint, params):
 
 
 def get_category_name(cat_id: str):
-    # 1️⃣ bo‘sh bo‘lsa — API chaqirmaymiz
     if not cat_id:
         return "Unknown"
 
-    # 2️⃣ DB cache
     cur.execute("SELECT name FROM categories WHERE category_id=?", (cat_id,))
     row = cur.fetchone()
     if row:
         return row[0]
 
-    # 3️⃣ XAVFSIZ API chaqiruv
     try:
         data = yt_api("videoCategories", {
             "part": "snippet",
             "id": cat_id,
             "regionCode": "US"
         })
-        if data.get("items"):
-            name = data["items"][0]["snippet"]["title"]
-        else:
-            name = "Unknown"
+        name = data["items"][0]["snippet"]["title"] if data.get("items") else "Unknown"
     except Exception:
         name = "Unknown"
 
-    # 4️⃣ DB ga saqlaymiz (abadiy cache)
     cur.execute(
         "INSERT OR IGNORE INTO categories VALUES (?,?)",
         (cat_id, name)
@@ -227,11 +220,11 @@ async def analyze(m: Message):
     if not vid:
         return
 
-    now = int(time.time())
+    now_ts = int(time.time())
     cur.execute("SELECT * FROM videos WHERE video_id=?", (vid,))
     row = cur.fetchone()
 
-    used_cache = bool(row and now - row[-1] < TTL_VIDEO)
+    used_cache = bool(row and now_ts - row[-1] < TTL_VIDEO)
 
     if not used_cache and credit <= 0:
         await m.answer("❌ Kredit tugagan", reply_markup=main_kb(credit))
@@ -261,7 +254,7 @@ async def analyze(m: Message):
             int(st.get("commentCount", 0)),
             ", ".join(sn.get("tags", [])),
             sn.get("description", ""),
-            now
+            now_ts
         ))
         conn.commit()
 
@@ -273,7 +266,9 @@ async def analyze(m: Message):
     _, title, channel, category, published, views, likes, comments, tags, desc, _ = cur.fetchone()
 
     dt = datetime.fromisoformat(published.replace("Z", "+00:00"))
-    hours = (datetime.utcnow() - dt).total_seconds() / 3600
+    now_utc = datetime.now(timezone.utc)
+    hours = (now_utc - dt).total_seconds() / 3600
+
     fraud = detect_like_fraud(views, likes, comments, hours)
 
     await m.answer(
@@ -390,7 +385,7 @@ async def noop(c: CallbackQuery):
 
 
 async def main():
-    print("🤖 BOT ISHLAYAPTI (FIXED, MAX TEJASH)")
+    print("🤖 BOT ISHLAYAPTI (FIXED TIMEZONE BUG)")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
