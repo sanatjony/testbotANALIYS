@@ -3,6 +3,7 @@ import re
 import hashlib
 import sqlite3
 import time
+import os
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
@@ -13,13 +14,19 @@ from aiogram.types import (
 )
 from aiogram.filters import Command
 
-# ================= CONFIG =================
-BOT_TOKEN = "YOUR_BOT_TOKEN"
-DB_NAME = "bot.db"
-# =========================================
+# ================= ENV =================
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = os.getenv("ADMIN_ID")
+
+if not BOT_TOKEN:
+    raise RuntimeError("❌ BOT_TOKEN topilmadi. Railway Variables ni tekshir!")
+
+BOT_TOKEN = BOT_TOKEN.strip()
+# ======================================
 
 
 # ================= DATABASE ===============
+DB_NAME = "bot.db"
 conn = sqlite3.connect(DB_NAME)
 cursor = conn.cursor()
 
@@ -31,7 +38,6 @@ CREATE TABLE IF NOT EXISTS videos (
     created_at INTEGER
 )
 """)
-
 conn.commit()
 # =========================================
 
@@ -51,24 +57,16 @@ def extract_video_id(url: str):
 
 
 def short_id(text: str) -> str:
-    """callback_data uchun xavfsiz ID (10 belgi)"""
     return hashlib.md5(text.encode()).hexdigest()[:10]
 
 
 def fake_top5(video_id: str):
-    """Fake TOP 5 konkurentlar"""
-    return [
-        f"{video_id}_competitor_1",
-        f"{video_id}_competitor_2",
-        f"{video_id}_competitor_3",
-        f"{video_id}_competitor_4",
-        f"{video_id}_competitor_5",
-    ]
+    return [f"{video_id}_competitor_{i}" for i in range(1, 6)]
 # =========================================
 
 
 # ================= BOT ====================
-bot = Bot(BOT_TOKEN)
+bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 
@@ -76,7 +74,7 @@ dp = Dispatcher()
 async def start(message: Message):
     await message.answer(
         "👋 Xush kelibsiz!\n\n"
-        "📊 YouTube video analiz:\n"
+        "📊 YouTube analiz bot\n"
         "/analyze <youtube_url>"
     )
 
@@ -95,7 +93,6 @@ async def analyze(message: Message):
 
     sid = short_id(video_id)
 
-    # Cache tekshirish
     cursor.execute("SELECT top5 FROM videos WHERE sid=?", (sid,))
     row = cursor.fetchone()
 
@@ -106,18 +103,14 @@ async def analyze(message: Message):
             (sid, video_id, "|".join(top5), int(time.time()))
         )
         conn.commit()
-    else:
-        top5 = row[0].split("|")
 
     keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🏆 TOP 5 KONKURENT",
-                    callback_data=f"top5:{sid}"
-                )
-            ]
-        ]
+        inline_keyboard=[[
+            InlineKeyboardButton(
+                text="🏆 TOP 5 KONKURENT",
+                callback_data=f"top5:{sid}"
+            )
+        ]]
     )
 
     await message.answer(
@@ -141,7 +134,7 @@ async def show_top5(callback: CallbackQuery):
 
     top5 = row[0].split("|")
 
-    text = "🏆 TOP 5 KONKURENT VIDEO:\n\n"
+    text = "🏆 TOP 5 KONKURENT:\n\n"
     for i, v in enumerate(top5, 1):
         text += f"{i}. {v}\n"
 
