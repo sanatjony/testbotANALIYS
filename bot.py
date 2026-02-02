@@ -17,13 +17,13 @@ bot = Bot(
 )
 dp = Dispatcher()
 
-# ================= YOUTUBE API =================
+# ================= YOUTUBE =================
 def yt(endpoint, params):
     params["key"] = YOUTUBE_API_KEY
     r = requests.get(
         f"https://www.googleapis.com/youtube/v3/{endpoint}",
         params=params,
-        timeout=12
+        timeout=15
     )
     r.raise_for_status()
     return r.json()
@@ -42,20 +42,21 @@ def clean(text):
 def similarity(a, b):
     return SequenceMatcher(None, a.lower(), b.lower()).ratio()
 
-def last_30_days(date_str):
+def last_60_days(date_str):
     d = datetime.strptime(date_str, "%Y-%m-%dT%H:%M:%SZ")
-    return d >= datetime.utcnow() - timedelta(days=30)
+    return d >= datetime.utcnow() - timedelta(days=60)
 
-# ================= CORE ANALYSIS =================
+# ================= CORE =================
 def competitor_top_titles(base_title):
     base_clean = clean(base_title)
     words = base_clean.split()
 
-    # 3 xil search query
     queries = [
         base_clean,
         " ".join(words[:4]),
-        " ".join(words[:2]) + " review"
+        " ".join(words[:3]),
+        words[0] + " review",
+        words[0] + " gameplay"
     ]
 
     results = []
@@ -73,26 +74,26 @@ def competitor_top_titles(base_title):
             vid = item["id"]["videoId"]
             snip = item["snippet"]
 
-            if not last_30_days(snip["publishedAt"]):
+            if not last_60_days(snip["publishedAt"]):
                 continue
 
-            video = yt("videos", {
+            v = yt("videos", {
                 "part": "statistics,snippet",
                 "id": vid
             })["items"]
 
-            if not video:
+            if not v:
                 continue
 
-            stats = video[0]["statistics"]
+            stats = v[0].get("statistics", {})
             views = int(stats.get("viewCount", 0))
 
-            if views < 500:
+            if views < 50:
                 continue
 
-            title = clean(video[0]["snippet"]["title"])
+            title = clean(v[0]["snippet"]["title"])
 
-            if any(similarity(title, r["title"]) > 0.85 for r in results):
+            if any(similarity(title, r["title"]) > 0.70 for r in results):
                 continue
 
             results.append({
@@ -100,7 +101,7 @@ def competitor_top_titles(base_title):
                 "views": views
             })
 
-            if len(results) >= 15:
+            if len(results) >= 10:
                 return sorted(results, key=lambda x: x["views"], reverse=True)
 
     return sorted(results, key=lambda x: x["views"], reverse=True)
@@ -112,9 +113,9 @@ async def start(msg: Message):
         "👋 <b>Salom!</b>\n\n"
         "YouTube video linkini yuboring.\n\n"
         "🧠 Konkurentlar asosida:\n"
-        "• TOP NOMLAR\n"
-        "• Oxirgi 30 kun\n"
-        "• Ko‘rishlar soni bilan\n"
+        "• Oxirgi 60 kun\n"
+        "• TOP nomlar\n"
+        "• 👁 View soni bilan\n"
         "• CTR’ga mos"
     )
 
@@ -164,7 +165,7 @@ async def cb_top(cb: CallbackQuery):
         await cb.answer()
         return
 
-    text = "🧠 <b>OXIRGI 30 KUN — KONKURENTLAR TOP NOMLARI:</b>\n\n"
+    text = "🧠 <b>OXIRGI 60 KUN — KONKURENTLAR TOP NOMLARI:</b>\n\n"
     for i, t in enumerate(tops, 1):
         text += f"{i}. {t['title']} — 👁 {t['views']:,}\n"
 
