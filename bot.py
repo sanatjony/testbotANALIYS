@@ -4,45 +4,50 @@ import hashlib
 import sqlite3
 import time
 import os
+import requests
+from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import (
-    Message,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    CallbackQuery
-)
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.filters import Command
 
 # ================= ENV =================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEYS")  # BITTA KEY
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
-if not BOT_TOKEN:
-    raise RuntimeError("❌ BOT_TOKEN topilmadi (Railway Variables ni tekshir)")
+if not BOT_TOKEN or not YOUTUBE_API_KEY:
+    raise RuntimeError("ENV variables yo‘q (BOT_TOKEN / YOUTUBE_API_KEYS)")
 
 BOT_TOKEN = BOT_TOKEN.strip()
+YOUTUBE_API_KEY = YOUTUBE_API_KEY.strip()
 # =====================================
 
 
 # ================= DATABASE ============
-DB_NAME = "bot.db"
-conn = sqlite3.connect(DB_NAME)
+DB = "bot.db"
+conn = sqlite3.connect(DB)
 cur = conn.cursor()
 
 cur.execute("""
 CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY,
-    credit INTEGER
+    credit INTEGER,
+    last_reset INTEGER
 )
 """)
 
 cur.execute("""
 CREATE TABLE IF NOT EXISTS videos (
-    sid TEXT PRIMARY KEY,
-    video_id TEXT,
-    top5 TEXT,
-    created_at INTEGER
+    video_id TEXT PRIMARY KEY,
+    title TEXT,
+    channel TEXT,
+    published TEXT,
+    views INTEGER,
+    likes INTEGER,
+    comments INTEGER,
+    tags TEXT,
+    description TEXT
 )
 """)
 
@@ -53,188 +58,215 @@ conn.commit()
 # ================= HELPERS =============
 YOUTUBE_REGEX = r"(https?://(?:www\.)?(?:youtube\.com|youtu\.be)/\S+)"
 
-def extract_video_id(url: str):
-    patterns = [
-        r"v=([^&]+)",
-        r"youtu\.be/([^?]+)",
-        r"shorts/([^?]+)"
-    ]
-    for p in patterns:
+def extract_video_id(url):
+    for p in [r"v=([^&]+)", r"youtu\.be/([^?]+)", r"shorts/([^?]+)"]:
         m = re.search(p, url)
         if m:
             return m.group(1)
     return None
 
 
-def short_id(text: str) -> str:
-    return hashlib.md5(text.encode()).hexdigest()[:10]
+def reset_credit_if_needed(uid):
+    cur.execute("SELECT credit, last_reset FROM users WHERE user_id=?", (uid,))
+    row = cur.fetchone()
+    now = int(time.time())
+    if row:
+        credit, last = row
+        if now - last >= 86400:
+            cur.execute(
+                "UPDATE users SET credit=5, last_reset=? WHERE user_id=?",
+                (now, uid)
+            )
+            conn.commit()
 
 
-def fake_top5(video_id: str):
-    return [f"{video_id}_competitor_{i}" for i in range(1, 6)]
+def get_or_create_user(uid):
+    cur.execute("SELECT credit FROM users WHERE user_id=?", (uid,))
+    row = cur.fetchone()
+    if not row:
+        cur.execute(
+            "INSERT INTO users VALUES (?,?,?)",
+            (uid, 5, int(time.time()))
+        )
+        conn.commit()
+        return 5
+    reset_credit_if_needed(uid)
+    cur.execute("SELECT credit FROM users WHERE user_id=?", (uid,))
+    return cur.fetchone()[0]
+
+
+def update_credit(uid, val):
+    cur.execute("UPDATE users SET credit = credit + ? WHERE user_id=?", (val, uid))
+    conn.commit()
+
+
+def yt_api(url, params):
+    params["key"] = YOUTUBE_API_KEY
+    r = requests.get(url, params=params, timeout=20)
+    r.raise_for_status()
+    return r.json()
 # =====================================
 
 
 # ================= BOT =================
-bot = Bot(token=BOT_TOKEN)
+bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 # =====================================
 
 
-# ================= USERS ===============
-def get_user(uid: int):
-    cur.execute("SELECT credit FROM users WHERE user_id=?", (uid,))
-    return cur.fetchone()
+def main_keyboard(credit):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"💳 Kredit: {credit}/5 (24 soatda yangilanadi)", callback_data="noop")]
+    ])
 
 
-def add_user(uid: int):
-    cur.execute(
-        "INSERT OR IGNORE INTO users (user_id, credit) VALUES (?, ?)",
-        (uid, 5)
-    )
-    conn.commit()
-
-
-def update_credit(uid: int, value: int):
-    cur.execute(
-        "UPDATE users SET credit = credit + ? WHERE user_id=?",
-        (value, uid)
-    )
-    conn.commit()
-# =====================================
+def result_keyboard(video_id):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🧠 TOP KONKURENT NOMLAR", callback_data=f"top:{video_id}")],
+        [InlineKeyboardButton(text="🏷 TAG / TAVSIF", callback_data=f"tags:{video_id}")],
+        [InlineKeyboardButton(text="📺 RAQOBATCHI KANALLAR", callback_data=f"channels:{video_id}")]
+    ])
 
 
 @dp.message(Command("start"))
-async def start(message: Message):
-    add_user(message.from_user.id)
-    await message.answer(
+async def start(m: Message):
+    credit = get_or_create_user(m.from_user.id)
+    await m.answer(
         "👋 Xush kelibsiz!\n\n"
-        "🎁 Sizga 5 ta bepul kredit berildi\n\n"
-        "👉 YouTube linkni shunchaki yuboring.\n"
-        "Bot o‘zi analiz qiladi 🚀"
+        "👉 YouTube linkni yuboring.\n"
+        "Bot avtomatik analiz qiladi.",
+        reply_markup=main_keyboard(credit)
     )
 
 
-@dp.message(Command("balance"))
-async def balance(message: Message):
-    user = get_user(message.from_user.id)
-    if not user:
-        add_user(message.from_user.id)
-        user = (5,)
-    await message.answer(f"💳 Balansingiz: {user[0]} kredit")
-
-
-# ============== CORE ANALIZ =============
-async def process_video(message: Message, url: str):
-    uid = message.from_user.id
-    user = get_user(uid)
-
-    if not user:
-        add_user(uid)
-        user = (5,)
-
-    if user[0] <= 0:
-        await message.answer("❌ Kredit tugagan")
+# ============== ANALIZ =============
+@dp.message(F.text.regexp(YOUTUBE_REGEX))
+async def analyze(m: Message):
+    uid = m.from_user.id
+    credit = get_or_create_user(uid)
+    if credit <= 0:
+        await m.answer("❌ Kredit tugagan", reply_markup=main_keyboard(credit))
         return
 
-    video_id = extract_video_id(url)
-    if not video_id:
-        await message.answer("❌ YouTube linkni taniy olmadim")
+    url = re.search(YOUTUBE_REGEX, m.text).group(1)
+    vid = extract_video_id(url)
+    if not vid:
         return
 
-    sid = short_id(video_id)
+    cur.execute("SELECT title FROM videos WHERE video_id=?", (vid,))
+    cached = cur.fetchone()
 
-    cur.execute("SELECT top5 FROM videos WHERE sid=?", (sid,))
-    row = cur.fetchone()
+    if not cached:
+        data = yt_api(
+            "https://www.googleapis.com/youtube/v3/videos",
+            {
+                "part": "snippet,statistics",
+                "id": vid
+            }
+        )
 
-    if not row:
-        top5 = fake_top5(video_id)
+        if not data["items"]:
+            await m.answer("❌ Video topilmadi")
+            return
+
+        item = data["items"][0]
+        sn = item["snippet"]
+        st = item["statistics"]
+
+        title = sn["title"]
+        channel = sn["channelTitle"]
+        published = sn["publishedAt"]
+        views = int(st.get("viewCount", 0))
+        likes = int(st.get("likeCount", 0))
+        comments = int(st.get("commentCount", 0))
+        tags = ", ".join(sn.get("tags", []))
+        desc = sn.get("description", "")
+
         cur.execute(
-            "INSERT INTO videos VALUES (?,?,?,?)",
-            (sid, video_id, "|".join(top5), int(time.time()))
+            "INSERT OR REPLACE INTO videos VALUES (?,?,?,?,?,?,?, ?,?)",
+            (vid, title, channel, published, views, likes, comments, tags, desc)
         )
         update_credit(uid, -1)
+        credit -= 1
         conn.commit()
     else:
-        top5 = row[0].split("|")
+        cur.execute("SELECT * FROM videos WHERE video_id=?", (vid,))
+        _, title, channel, published, views, likes, comments, tags, desc = cur.fetchone()
 
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🏆 TOP 5 KONKURENT",
-                    callback_data=f"top5:{sid}"
-                )
-            ]
-        ]
+    dt = datetime.fromisoformat(published.replace("Z", "+00:00")) + timedelta(hours=5)
+
+    await m.answer(
+        f"🎬 {title}\n"
+        f"⏰ Yuklangan: {dt.strftime('%Y-%m-%d %H:%M')} (Toshkent)\n"
+        f"📺 Kanal: {channel}\n\n"
+        f"👁 {views}   👍 {likes}   💬 {comments}",
+        reply_markup=result_keyboard(vid)
     )
 
-    await message.answer(
-        f"🎬 Video ID: {video_id}\n"
-        f"📊 Analiz tayyor",
-        reply_markup=keyboard
+
+@dp.callback_query(F.data.startswith("top:"))
+async def top_videos(c: CallbackQuery):
+    vid = c.data.split(":")[1]
+    data = yt_api(
+        "https://www.googleapis.com/youtube/v3/search",
+        {
+            "part": "snippet",
+            "q": vid,
+            "type": "video",
+            "maxResults": 5
+        }
     )
-# =====================================
+
+    text = "🧠 TOP KONKURENT NOMLAR (30 kun):\n\n"
+    for i, it in enumerate(data["items"], 1):
+        text += f"{i}. {it['snippet']['title']}\n"
+
+    await c.message.answer(text)
+    await c.answer()
 
 
-@dp.message(Command("analyze"))
-async def analyze_cmd(message: Message):
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2:
-        await message.answer("❗ YouTube link yuboring")
-        return
-    await process_video(message, parts[1])
+@dp.callback_query(F.data.startswith("tags:"))
+async def tags(c: CallbackQuery):
+    vid = c.data.split(":")[1]
+    cur.execute("SELECT tags, description FROM videos WHERE video_id=?", (vid,))
+    tags, desc = cur.fetchone()
+
+    await c.message.answer(
+        f"🏷 VIDEO TAGLAR:\n{tags}\n\n"
+        f"DESCRIPTION:\n{desc[:3000]}"
+    )
+    await c.answer()
 
 
-@dp.message(F.text.regexp(YOUTUBE_REGEX))
-async def analyze_from_text(message: Message):
-    match = re.search(YOUTUBE_REGEX, message.text)
-    if match:
-        await process_video(message, match.group(1))
+@dp.callback_query(F.data.startswith("channels:"))
+async def channels(c: CallbackQuery):
+    vid = c.data.split(":")[1]
+    data = yt_api(
+        "https://www.googleapis.com/youtube/v3/search",
+        {
+            "part": "snippet",
+            "q": vid,
+            "type": "channel",
+            "maxResults": 5
+        }
+    )
+
+    text = "📺 RAQOBATCHI KANALLAR:\n\n"
+    for i, it in enumerate(data["items"], 1):
+        text += f"{i}. {it['snippet']['channelTitle']}\n"
+
+    await c.message.answer(text)
+    await c.answer()
 
 
-@dp.callback_query(F.data.startswith("top5:"))
-async def show_top5(callback: CallbackQuery):
-    sid = callback.data.split(":")[1]
-
-    cur.execute("SELECT top5 FROM videos WHERE sid=?", (sid,))
-    row = cur.fetchone()
-
-    if not row:
-        await callback.answer("❌ Ma’lumot topilmadi", show_alert=True)
-        return
-
-    top5 = row[0].split("|")
-
-    text = "🏆 TOP 5 KONKURENT:\n\n"
-    for i, v in enumerate(top5, 1):
-        text += f"{i}. {v}\n"
-
-    await callback.message.answer(text)
-    await callback.answer()
+@dp.callback_query(F.data == "noop")
+async def noop(c: CallbackQuery):
+    await c.answer()
 
 
-# ============== ADMIN ===================
-@dp.message(Command("addcredit"))
-async def add_credit(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    parts = message.text.split()
-    if len(parts) != 3:
-        await message.answer("❗ Format: /addcredit user_id amount")
-        return
-
-    uid = int(parts[1])
-    amount = int(parts[2])
-    update_credit(uid, amount)
-    await message.answer("✅ Kredit qo‘shildi")
-# =====================================
-
-
-# ================= RUN ==================
+# ================= RUN =================
 async def main():
-    print("🤖 FINAL BOT ISHGA TUSHDI")
+    print("🤖 FINAL BOT ISHLAYAPTI")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
