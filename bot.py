@@ -7,7 +7,10 @@ import requests
 from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.types import (
+    Message, InlineKeyboardMarkup,
+    InlineKeyboardButton, CallbackQuery
+)
 from aiogram.filters import Command
 
 # ================= ENV =================
@@ -23,8 +26,10 @@ YOUTUBE_API_KEY = YOUTUBE_API_KEY.strip()
 
 
 # ================= CONFIG ==============
-CACHE_TTL = 6 * 3600   # 6 soat
 CREDIT_DAILY = 5
+
+TTL_VIDEO = 6 * 3600        # 6 soat
+TTL_SEARCH = 12 * 3600      # 12 soat
 # =====================================
 
 
@@ -57,6 +62,23 @@ CREATE TABLE IF NOT EXISTS videos (
 )
 """)
 
+cur.execute("""
+CREATE TABLE IF NOT EXISTS search_cache (
+    query TEXT,
+    type TEXT,
+    result TEXT,
+    updated_at INTEGER,
+    PRIMARY KEY (query, type)
+)
+""")
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS categories (
+    category_id TEXT PRIMARY KEY,
+    name TEXT
+)
+""")
+
 conn.commit()
 # =====================================
 
@@ -84,26 +106,30 @@ def yt_api(endpoint, params):
 
 
 def get_category_name(cat_id):
+    cur.execute("SELECT name FROM categories WHERE category_id=?", (cat_id,))
+    row = cur.fetchone()
+    if row:
+        return row[0]
+
     data = yt_api("videoCategories", {
         "part": "snippet",
         "id": cat_id,
         "regionCode": "US"
     })
-    if data["items"]:
-        return data["items"][0]["snippet"]["title"]
-    return "Unknown"
+
+    name = data["items"][0]["snippet"]["title"] if data["items"] else "Unknown"
+    cur.execute("INSERT OR IGNORE INTO categories VALUES (?,?)", (cat_id, name))
+    conn.commit()
+    return name
 
 
 def detect_like_fraud(views, likes, comments, hours):
     if views == 0:
         return "⚪ Ma’lumot yetarli emas"
 
-    like_ratio = likes / views
-    comment_ratio = comments / views
-
-    if like_ratio > 0.25 and views > 1000:
-        return "🔴 LIKE NAKRUTKA EHTIMOLI YUQORI"
-    if comment_ratio < 0.001 and views > 5000:
+    if likes / views > 0.25 and views > 1000:
+        return "🔴 LIKE NAKRUTKA EHTIMOLI"
+    if comments / views < 0.001 and views > 5000:
         return "🟡 SHUBHALI FAOLLIGI"
     if hours < 2 and views > 10000:
         return "🟡 TEZ SUN’IY O‘SISH"
@@ -146,12 +172,24 @@ dp = Dispatcher()
 
 
 def main_kb(credit):
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text=f"💳 Kredit: {credit}/{CREDIT_DAILY} (24 soatda yangilanadi)",
-            callback_data="noop"
-        )]
-    ])
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(
+                text=f"💳 Kredit: {credit}/{CREDIT_DAILY} (24 soatda yangilanadi)",
+                callback_data="noop"
+            )]
+        ]
+    )
+
+
+def result_kb(vid):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🧠 TOP 10 KONKURENT VIDEO", callback_data=f"top:{vid}")],
+            [InlineKeyboardButton(text="📺 RAQOBATCHI KANALLAR", callback_data=f"channels:{vid}")],
+            [InlineKeyboardButton(text="🏷 TAG / TAVSIF", callback_data=f"tags:{vid}")]
+        ]
+    )
 
 
 @dp.message(Command("start"))
@@ -173,17 +211,13 @@ async def analyze(m: Message):
     if not vid:
         return
 
-    # CACHE tekshirish
+    now = int(time.time())
     cur.execute("SELECT * FROM videos WHERE video_id=?", (vid,))
     row = cur.fetchone()
 
-    now = int(time.time())
     used_cache = False
-
-    if row:
-        updated_at = row[-1]
-        if now - updated_at < CACHE_TTL:
-            used_cache = True
+    if row and now - row[-1] < TTL_VIDEO:
+        used_cache = True
 
     if not used_cache and credit <= 0:
         await m.answer("❌ Kredit tugagan", reply_markup=main_kb(credit))
@@ -194,16 +228,11 @@ async def analyze(m: Message):
             "part": "snippet,statistics",
             "id": vid
         })
-
         item = data["items"][0]
         sn = item["snippet"]
         st = item["statistics"]
 
         category = get_category_name(sn.get("categoryId", ""))
-
-        views = int(st.get("viewCount", 0))
-        likes = int(st.get("likeCount", 0))
-        comments = int(st.get("commentCount", 0))
 
         cur.execute("""
         INSERT OR REPLACE INTO videos VALUES (?,?,?,?,?,?,?,?,?,?,?)
@@ -213,9 +242,9 @@ async def analyze(m: Message):
             sn["channelTitle"],
             category,
             sn["publishedAt"],
-            views,
-            likes,
-            comments,
+            int(st.get("viewCount", 0)),
+            int(st.get("likeCount", 0)),
+            int(st.get("commentCount", 0)),
             ", ".join(sn.get("tags", [])),
             sn.get("description", ""),
             now
@@ -231,7 +260,6 @@ async def analyze(m: Message):
 
     dt = datetime.fromisoformat(published.replace("Z", "+00:00"))
     hours = (datetime.utcnow() - dt).total_seconds() / 3600
-
     fraud = detect_like_fraud(views, likes, comments, hours)
 
     await m.answer(
@@ -241,8 +269,105 @@ async def analyze(m: Message):
         f"⏰ Yuklangan: {dt.strftime('%Y-%m-%d %H:%M')} UTC\n\n"
         f"👁 {views}   👍 {likes}   💬 {comments}\n"
         f"🚨 {fraud}",
-        reply_markup=main_kb(credit)
+        reply_markup=result_kb(vid)
     )
+
+
+# ---------- TOP 10 VIDEO ----------
+@dp.callback_query(F.data.startswith("top:"))
+async def top_videos(c: CallbackQuery):
+    vid = c.data.split(":")[1]
+    cur.execute("SELECT title FROM videos WHERE video_id=?", (vid,))
+    title = cur.fetchone()[0]
+
+    now = int(time.time())
+    cur.execute(
+        "SELECT result, updated_at FROM search_cache WHERE query=? AND type='video'",
+        (title,)
+    )
+    row = cur.fetchone()
+
+    if row and now - row[1] < TTL_SEARCH:
+        result = row[0]
+    else:
+        data = yt_api("search", {
+            "part": "snippet",
+            "type": "video",
+            "order": "viewCount",
+            "publishedAfter": (datetime.utcnow() - timedelta(days=30)).isoformat("T") + "Z",
+            "maxResults": 10,
+            "q": title
+        })
+        lines = []
+        for i, it in enumerate(data["items"], 1):
+            v_id = it["id"]["videoId"]
+            v_title = it["snippet"]["title"]
+            lines.append(f"{i}. {v_title}\nhttps://youtu.be/{v_id}")
+        result = "\n\n".join(lines)
+
+        cur.execute(
+            "INSERT OR REPLACE INTO search_cache VALUES (?,?,?,?)",
+            (title, "video", result, now)
+        )
+        conn.commit()
+
+    await c.message.answer("🧠 TOP 10 KONKURENT VIDEO (30 kun):\n\n" + result)
+    await c.answer()
+
+
+# ---------- TOP 5 KANAL ----------
+@dp.callback_query(F.data.startswith("channels:"))
+async def channels(c: CallbackQuery):
+    vid = c.data.split(":")[1]
+    cur.execute("SELECT title FROM videos WHERE video_id=?", (vid,))
+    title = cur.fetchone()[0]
+
+    now = int(time.time())
+    cur.execute(
+        "SELECT result, updated_at FROM search_cache WHERE query=? AND type='channel'",
+        (title,)
+    )
+    row = cur.fetchone()
+
+    if row and now - row[1] < TTL_SEARCH:
+        result = row[0]
+    else:
+        data = yt_api("search", {
+            "part": "snippet",
+            "type": "channel",
+            "maxResults": 5,
+            "q": title
+        })
+        lines = []
+        for i, it in enumerate(data["items"], 1):
+            cid = it["id"]["channelId"]
+            name = it["snippet"]["channelTitle"]
+            lines.append(f"{i}. {name}\nhttps://www.youtube.com/channel/{cid}")
+        result = "\n\n".join(lines)
+
+        cur.execute(
+            "INSERT OR REPLACE INTO search_cache VALUES (?,?,?,?)",
+            (title, "channel", result, now)
+        )
+        conn.commit()
+
+    await c.message.answer("📺 RAQOBATCHI KANALLAR:\n\n" + result)
+    await c.answer()
+
+
+# ---------- TAG / DESCRIPTION ----------
+@dp.callback_query(F.data.startswith("tags:"))
+async def tags(c: CallbackQuery):
+    vid = c.data.split(":")[1]
+    cur.execute("SELECT tags, description FROM videos WHERE video_id=?", (vid,))
+    tags, desc = cur.fetchone()
+
+    await c.message.answer(
+        f"🏷 VIDEO TAGLAR:\n```\n{tags}\n```\n\n"
+        f"📝 DESCRIPTION:\n```\n{desc[:3500]}\n```",
+        parse_mode="Markdown"
+    )
+    await c.answer()
 
 
 @dp.callback_query(F.data == "noop")
@@ -251,7 +376,7 @@ async def noop(c: CallbackQuery):
 
 
 async def main():
-    print("🤖 BOT ISHLAYAPTI (DB + CACHE + CATEGORY + FRAUD)")
+    print("🤖 BOT ISHLAYAPTI (MAXIMAL TEJASH)")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
