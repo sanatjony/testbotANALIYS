@@ -23,9 +23,12 @@ bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
 # ================= CONSTANTS =================
-TRIGGER_WORDS = [
-    "vs", "challenge", "crash test", "experiment",
-    "gameplay", "realistic", "physics", "simulation"
+BANNED = {"hack", "crack", "cheat", "free download", "mod apk"}
+
+TRIGGERS = [
+    "vs", "challenge", "experiment", "gameplay",
+    "insane", "crazy", "unexpected", "extreme",
+    "realistic physics"
 ]
 
 # ================= HELPERS =================
@@ -50,11 +53,13 @@ def yt_search(query: str, limit=40):
     return requests.get(url, timeout=10).json().get("items", [])
 
 def extract_phrases(title: str):
-    words = re.findall(r"[A-Za-z]{4,}", title)
+    words = re.findall(r"[A-Za-z0-9]{3,}", title)
     phrases = []
-    for size in (2, 3):
+    for size in (2, 3, 4):
         for i in range(len(words) - size + 1):
-            phrases.append(" ".join(words[i:i+size]))
+            phrase = " ".join(words[i:i+size])
+            if not any(b in phrase.lower() for b in BANNED):
+                phrases.append(phrase)
     return phrases
 
 # ================= START =================
@@ -63,7 +68,7 @@ async def start_cmd(message: types.Message):
     await message.answer(
         "🧪 *YouTube Analyser — TEST*\n\n"
         "📌 YouTube video link yuboring\n"
-        "✍️ AI title analiz qilinadi",
+        "✍️ AI Title + 🏷 AI Tag generator",
         parse_mode="Markdown"
     )
 
@@ -87,43 +92,29 @@ async def handle_video(message: types.Message):
 
     title = sn["title"]
     channel = sn["channelTitle"]
-    published = datetime.fromisoformat(
-        sn["publishedAt"].replace("Z", "+00:00")
-    ).astimezone(TZ)
-
-    views = int(st.get("viewCount", 0))
-    likes = int(st.get("likeCount", 0))
-    comments = int(st.get("commentCount", 0))
-
-    ratio = (likes / views * 100) if views else 0
-    flag = "🟢 Normal"
-    if ratio > 30:
-        flag = "🔴 Nakrutka ehtimoli"
-    elif ratio > 15:
-        flag = "🟡 Shubhali"
 
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="✍️ Title AI",
+                    text="✍️ AI Title",
                     callback_data=f"titleai:{vid}"
+                ),
+                InlineKeyboardButton(
+                    text="🏷 AI Tags",
+                    callback_data=f"tagai:{vid}"
                 )
             ]
         ]
     )
 
-    text = (
+    await message.answer(
         f"🎬 *Mavjud video nomi:*\n{title}\n\n"
-        f"📺 Kanal: {channel}\n"
-        f"🕒 {published.strftime('%d.%m.%Y %H:%M')} (UTC+5)\n\n"
-        f"📊 View: {views}\n"
-        f"👍 Like: {likes}\n"
-        f"💬 Comment: {comments}\n\n"
-        f"{flag}"
+        f"📺 Kanal: {channel}\n\n"
+        "👇 Kerakli AI funksiyani tanlang",
+        parse_mode="Markdown",
+        reply_markup=keyboard
     )
-
-    await message.answer(text, parse_mode="Markdown", reply_markup=keyboard)
 
 # ================= AI TITLE =================
 @dp.callback_query(F.data.startswith("titleai:"))
@@ -141,33 +132,53 @@ async def title_ai_cb(call: types.CallbackQuery):
     if not phrases:
         phrases = extract_phrases(base_title)
 
-    counter = Counter(phrases)
-    core = [p for p, _ in counter.most_common(5)]
+    core = [p for p, _ in Counter(phrases).most_common(6)]
 
     titles = []
     for c in core:
-        for t in TRIGGER_WORDS:
-            new_title = f"{c} {t.title()} | {base_title.split('|')[0]}"
-            if 45 <= len(new_title) <= 90:
-                titles.append(new_title)
+        for t in TRIGGERS:
+            new = f"{c} {t} | {base_title.split('|')[0]}"
+            if 45 <= len(new) <= 90:
+                titles.append(new)
             if len(titles) >= 5:
                 break
         if len(titles) >= 5:
             break
 
-    if not titles:
-        titles = [base_title]
-
-    text = "✍️ *AI tavsiya qilgan optimal video nomlari*\n\n"
+    text = "✍️ *AI tavsiya qilgan clickbait titlelar*\n\n"
     for i, t in enumerate(titles, 1):
         text += f"{i}. {t}\n\n"
 
     await call.message.answer(text, parse_mode="Markdown")
     await call.answer()
 
+# ================= AI TAGS =================
+@dp.callback_query(F.data.startswith("tagai:"))
+async def tag_ai_cb(call: types.CallbackQuery):
+    vid = call.data.split("tagai:", 1)[1]
+    video = yt_video(vid)
+
+    base_title = video["snippet"]["title"]
+    items = yt_search(base_title)
+
+    tags = []
+    for i in items:
+        tags.extend(extract_phrases(i["snippet"]["title"]))
+
+    tags = [t for t, _ in Counter(tags).most_common(20)]
+
+    text = (
+        "🏷 *AI tavsiya qilgan top taglar*\n\n"
+        "```\n" + ", ".join(tags) + "\n```\n\n"
+        "📈 CTR + Search uchun mos"
+    )
+
+    await call.message.answer(text, parse_mode="Markdown")
+    await call.answer()
+
 # ================= RUN =================
 async def main():
-    print("TEST bot ishga tushdi (FIXED)")
+    print("TEST bot ishga tushdi (CTR MODE)")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
