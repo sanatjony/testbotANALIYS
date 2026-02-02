@@ -2,6 +2,8 @@ import os
 import re
 import asyncio
 import requests
+from collections import Counter
+
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
     Message,
@@ -47,72 +49,62 @@ def yt_api(endpoint, params):
     return r.json()
 
 
-# ================= AI LOGIC =================
+# ================= AI TITLE (CTR LOGIC) =================
 def ai_titles(title: str):
     base = title.split("|")[0].strip()
+
     return [
-        f"{base} 😱 INSANE Result!",
-        f"{base} 🔥 You Won’t Believe This",
-        f"{base} 💥 CRAZY Moment",
-        f"{base} ⚠️ Unexpected Outcome",
-        f"{base} 🚀 SHOCKING Video",
+        f"{base} 😱 INSANE Result Nobody Expected",
+        f"I Tested {base}… The Result SHOCKED Me",
+        f"{base} 🚨 This Went Completely Wrong",
+        f"{base} | The Craziest Outcome Ever",
+        f"{base} 🔥 You Won’t Believe the Ending",
     ]
 
 
-def ai_tags(title: str):
-    t = title.lower()
+# ================= AI TAGS (SEMANTIC + COMPETITOR) =================
+def ai_tags(video_title: str, competitor_channels: list[str]):
+    t = video_title.lower()
     tags = set()
+
+    # Core topic
+    if "beamng" in t:
+        tags |= {
+            "beamng drive", "beamng gameplay", "beamng mods",
+            "beamng crash", "beamng simulation"
+        }
+
+    if "truck" in t or "flatbed" in t:
+        tags |= {
+            "flatbed truck", "truck challenge",
+            "truck experiment", "truck vs car"
+        }
 
     if "mcqueen" in t or "cars" in t:
         tags |= {
-            "pixar cars", "lightning mcqueen", "disney cars",
-            "cars toys", "mcqueen video"
+            "pixar cars", "lightning mcqueen",
+            "disney cars", "cars gameplay"
         }
 
-    if "truck" in t:
-        tags |= {
-            "flatbed truck", "truck challenge",
-            "truck experiment", "truck gameplay"
-        }
+    # Competitor channel names → keyword signal
+    for ch in competitor_channels:
+        words = ch.lower().split()
+        for w in words:
+            if len(w) > 3:
+                tags.add(w)
 
-    if "lyrics" in t or "song" in t:
-        tags |= {
-            "viral song", "tiktok song", "english lyrics",
-            "lyrics video", "viral music"
-        }
-
+    # CTR / Search helpers
     tags |= {
-        "viral video", "youtube shorts",
-        "trending video", "popular video"
+        "viral gameplay", "trending video",
+        "satisfying crash", "realistic physics",
+        "gaming shorts", "youtube gaming"
     }
 
     return ", ".join(sorted(tags))
 
 
-def global_trend_score(title: str):
-    """
-    Grafik yo‘q.
-    Tezkor baho (heuristic).
-    """
-    score = 0
-    t = title.lower()
-
-    if "viral" in t or "tiktok" in t:
-        score += 2
-    if "mcqueen" in t or "cars" in t:
-        score += 1
-    if "lyrics" in t:
-        score += 1
-
-    if score >= 3:
-        return "🟢 O‘sishda"
-    elif score == 2:
-        return "🟡 Barqaror"
-    else:
-        return "🔴 Past"
-
-
-def competitor_analysis(keyword: str):
+# ================= COMPETITOR ANALYSIS (REAL TOP) =================
+def competitor_channels(keyword: str):
     data = yt_api(
         "search",
         {
@@ -123,14 +115,14 @@ def competitor_analysis(keyword: str):
         }
     )
 
-    channels = set()
+    channels = []
     for item in data.get("items", []):
-        channels.add(item["snippet"]["channelTitle"])
+        channels.append(item["snippet"]["channelTitle"])
 
-    return {
-        "videos": len(data.get("items", [])),
-        "channels": len(channels),
-    }
+    counter = Counter(channels)
+    top = counter.most_common(5)
+
+    return top
 
 
 # ================= HANDLERS =================
@@ -142,9 +134,8 @@ async def start(msg: Message):
         "Men sizga:\n"
         "🧠 <b>TOP NOMLAR</b>\n"
         "🏷 <b>TOP TAGLAR</b>\n"
-        "📊 <b>Raqobat analizi</b>\n"
-        "📈 <b>Global trend (1 oy)</b>\n\n"
-        "chiqarib beraman."
+        "🎯 <b>Raqobatchi kanallar (TOP)</b>\n\n"
+        "aniq va qotmaydigan analiz beraman."
     )
 
 
@@ -190,13 +181,9 @@ async def handle_video(msg: Message):
             ],
             [
                 InlineKeyboardButton(
-                    text="📊 Raqobat",
+                    text="🎯 Raqobatchi kanallar",
                     callback_data=f"comp:{video_id}"
-                ),
-                InlineKeyboardButton(
-                    text="📈 Global trend",
-                    callback_data=f"trend:{video_id}"
-                ),
+                )
             ],
         ]
     )
@@ -206,7 +193,9 @@ async def handle_video(msg: Message):
 
 @dp.callback_query(F.data.startswith("title:"))
 async def cb_title(cb: CallbackQuery):
+    await cb.answer()
     vid = cb.data.split(":")[1]
+
     video = yt_api("videos", {"part": "snippet", "id": vid})["items"][0]
     titles = ai_titles(video["snippet"]["title"])
 
@@ -217,47 +206,41 @@ async def cb_title(cb: CallbackQuery):
     await cb.message.answer(text)
 
 
+@dp.callback_query(F.data.startswith("comp:"))
+async def cb_comp(cb: CallbackQuery):
+    await cb.answer()
+    vid = cb.data.split(":")[1]
+
+    video = yt_api("videos", {"part": "snippet", "id": vid})["items"][0]
+    keyword = video["snippet"]["title"].split("|")[0]
+
+    top_channels = await asyncio.to_thread(competitor_channels, keyword)
+
+    text = "🎯 <b>Raqobatchi kanallar (TOP)</b>\n\n"
+    for i, (ch, count) in enumerate(top_channels, 1):
+        text += f"{i}. <b>{ch}</b>\n   🎬 O‘xshash videolar: {count}\n"
+
+    text += "\n🚀 <b>Ko‘p chiqayotgan kanallar — real raqobatchilar</b>"
+
+    await cb.message.answer(text)
+
+
 @dp.callback_query(F.data.startswith("tags:"))
 async def cb_tags(cb: CallbackQuery):
+    await cb.answer()
     vid = cb.data.split(":")[1]
+
     video = yt_api("videos", {"part": "snippet", "id": vid})["items"][0]
-    tags = ai_tags(video["snippet"]["title"])
+    keyword = video["snippet"]["title"].split("|")[0]
+
+    competitors = await asyncio.to_thread(competitor_channels, keyword)
+    competitor_names = [c[0] for c in competitors]
+
+    tags = ai_tags(video["snippet"]["title"], competitor_names)
 
     await cb.message.answer(
         "<b>🏷 TOP TAGLAR (copy-paste):</b>\n\n"
         f"<code>{tags}</code>"
-    )
-
-
-@dp.callback_query(F.data.startswith("trend:"))
-async def cb_trend(cb: CallbackQuery):
-    vid = cb.data.split(":")[1]
-    video = yt_api("videos", {"part": "snippet", "id": vid})["items"][0]
-    title = video["snippet"]["title"]
-
-    result = global_trend_score(title)
-    await cb.message.answer(
-        f"📈 <b>Global trend (1 oy)</b>\n"
-        f"🔑 Keyword: <b>{title.split('|')[0]}</b>\n"
-        f"📊 Natija: {result}"
-    )
-
-
-@dp.callback_query(F.data.startswith("comp:"))
-async def cb_comp(cb: CallbackQuery):
-    vid = cb.data.split(":")[1]
-    video = yt_api("videos", {"part": "snippet", "id": vid})["items"][0]
-    keyword = video["snippet"]["title"].split("|")[0]
-
-    data = await asyncio.to_thread(competitor_analysis, keyword)
-
-    await cb.message.answer(
-        "📊 <b>Raqobat (YouTube Search)</b>\n\n"
-        f"🔑 Keyword: <b>{keyword}</b>\n"
-        f"🎬 Top videolar: {data['videos']}\n"
-        f"📺 Turli kanallar: {data['channels']}\n\n"
-        f"📌 Xulosa: "
-        f"{'🔴 Raqobat yuqori' if data['channels'] > 10 else '🟢 Raqobat past'}"
     )
 
 
