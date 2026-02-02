@@ -15,7 +15,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEYS")
 
 if not BOT_TOKEN or not YOUTUBE_API_KEY:
-    raise RuntimeError("ENV yo‘q")
+    raise RuntimeError("BOT_TOKEN yoki YOUTUBE_API_KEYS yo‘q")
 
 BOT_TOKEN = BOT_TOKEN.strip()
 YOUTUBE_API_KEY = YOUTUBE_API_KEY.strip()
@@ -39,6 +39,11 @@ cur.execute("""
 CREATE TABLE IF NOT EXISTS videos (
     video_id TEXT PRIMARY KEY,
     title TEXT,
+    channel TEXT,
+    published TEXT,
+    views INTEGER,
+    likes INTEGER,
+    comments INTEGER,
     tags TEXT,
     description TEXT
 )
@@ -60,7 +65,11 @@ def extract_video_id(url):
 
 def yt_api(endpoint, params):
     params["key"] = YOUTUBE_API_KEY
-    r = requests.get(f"https://www.googleapis.com/youtube/v3/{endpoint}", params=params, timeout=20)
+    r = requests.get(
+        f"https://www.googleapis.com/youtube/v3/{endpoint}",
+        params=params,
+        timeout=20
+    )
     r.raise_for_status()
     return r.json()
 # =====================================
@@ -80,7 +89,10 @@ def get_credit(uid):
     credit, last = row
     if now - last >= 86400:
         credit = 5
-        cur.execute("UPDATE users SET credit=5, last_reset=? WHERE user_id=?", (now, uid))
+        cur.execute(
+            "UPDATE users SET credit=5, last_reset=? WHERE user_id=?",
+            (now, uid)
+        )
         conn.commit()
 
     return credit
@@ -96,7 +108,10 @@ dp = Dispatcher()
 
 def main_kb(credit):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"💳 Kredit: {credit}/5", callback_data="noop")]
+        [InlineKeyboardButton(
+            text=f"💳 Kredit: {credit}/5 (24 soatda yangilanadi)",
+            callback_data="noop"
+        )]
     ])
 
 def result_kb(vid):
@@ -131,32 +146,60 @@ async def analyze(m: Message):
         return
 
     data = yt_api("videos", {
-        "part": "snippet",
+        "part": "snippet,statistics",
         "id": vid
     })
 
-    sn = data["items"][0]["snippet"]
+    if not data["items"]:
+        await m.answer("❌ Video topilmadi")
+        return
+
+    item = data["items"][0]
+    sn = item["snippet"]
+    st = item["statistics"]
+
     title = sn["title"]
+    channel = sn["channelTitle"]
+    published = sn["publishedAt"]
+    views = int(st.get("viewCount", 0))
+    likes = int(st.get("likeCount", 0))
+    comments = int(st.get("commentCount", 0))
     tags = ", ".join(sn.get("tags", []))
     desc = sn.get("description", "")
 
     cur.execute(
-        "INSERT OR REPLACE INTO videos VALUES (?,?,?,?)",
-        (vid, title, tags, desc)
+        "INSERT OR REPLACE INTO videos VALUES (?,?,?,?,?,?,?,?,?)",
+        (vid, title, channel, published, views, likes, comments, tags, desc)
     )
+    conn.commit()
+
     use_credit(uid)
     credit -= 1
 
+    dt = datetime.fromisoformat(published.replace("Z", "+00:00")) + timedelta(hours=5)
+
     await m.answer(
-        f"🎬 {title}\n\n"
-        f"👇 Natijalarni tanlang",
+        f"🎬 {title}\n"
+        f"⏰ Yuklangan: {dt.strftime('%Y-%m-%d %H:%M')} (Toshkent vaqti)\n"
+        f"📺 Kanal: {channel}\n\n"
+        f"👁 {views}   👍 {likes}   💬 {comments}",
         reply_markup=result_kb(vid)
     )
 
 
+# -------- TOP 10 VIDEO (TITLE BILAN) --------
 @dp.callback_query(F.data.startswith("top:"))
 async def top_videos(c: CallbackQuery):
     vid = c.data.split(":")[1]
+    cur.execute("SELECT title FROM videos WHERE video_id=?", (vid,))
+    row = cur.fetchone()
+
+    if not row:
+        await c.message.answer("❌ Video ma’lumoti yo‘q")
+        await c.answer()
+        return
+
+    title = row[0]
 
     data = yt_api("search", {
         "part": "snippet",
@@ -164,29 +207,49 @@ async def top_videos(c: CallbackQuery):
         "order": "viewCount",
         "publishedAfter": (datetime.utcnow() - timedelta(days=30)).isoformat("T") + "Z",
         "maxResults": 10,
-        "q": vid
+        "q": title
     })
+
+    if not data["items"]:
+        await c.message.answer("❌ Konkurent video topilmadi")
+        await c.answer()
+        return
 
     text = "🧠 TOP 10 KONKURENT VIDEO (30 kun):\n\n"
     for i, it in enumerate(data["items"], 1):
         v_id = it["id"]["videoId"]
-        title = it["snippet"]["title"]
-        text += f"{i}. {title}\nhttps://youtu.be/{v_id}\n\n"
+        v_title = it["snippet"]["title"]
+        text += f"{i}. {v_title}\nhttps://youtu.be/{v_id}\n\n"
 
     await c.message.answer(text)
     await c.answer()
 
 
+# -------- TOP 5 KANAL --------
 @dp.callback_query(F.data.startswith("channels:"))
 async def channels(c: CallbackQuery):
     vid = c.data.split(":")[1]
+    cur.execute("SELECT title FROM videos WHERE video_id=?", (vid,))
+    row = cur.fetchone()
+
+    if not row:
+        await c.message.answer("❌ Ma’lumot yo‘q")
+        await c.answer()
+        return
+
+    title = row[0]
 
     data = yt_api("search", {
         "part": "snippet",
         "type": "channel",
         "maxResults": 5,
-        "q": vid
+        "q": title
     })
+
+    if not data["items"]:
+        await c.message.answer("❌ Raqobatchi kanal topilmadi")
+        await c.answer()
+        return
 
     text = "📺 RAQOBATCHI KANALLAR:\n\n"
     for i, it in enumerate(data["items"], 1):
@@ -198,11 +261,19 @@ async def channels(c: CallbackQuery):
     await c.answer()
 
 
+# -------- TAG / DESCRIPTION --------
 @dp.callback_query(F.data.startswith("tags:"))
 async def tags(c: CallbackQuery):
     vid = c.data.split(":")[1]
     cur.execute("SELECT tags, description FROM videos WHERE video_id=?", (vid,))
-    tags, desc = cur.fetchone()
+    row = cur.fetchone()
+
+    if not row:
+        await c.message.answer("❌ Ma’lumot yo‘q")
+        await c.answer()
+        return
+
+    tags, desc = row
 
     await c.message.answer(
         f"🏷 VIDEO TAGLAR:\n```\n{tags}\n```\n\n"
@@ -218,6 +289,7 @@ async def noop(c: CallbackQuery):
 
 
 async def main():
+    print("🤖 BOT ISHLAYAPTI (FIXED)")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
