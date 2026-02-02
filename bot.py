@@ -6,8 +6,13 @@ import os
 import requests
 from datetime import datetime, timedelta, timezone
 
-from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.types import (
+    Message,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    CallbackQuery
+)
 from aiogram.filters import Command
 
 # ================= ENV =================
@@ -15,16 +20,18 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEYS")
 
 if not BOT_TOKEN or not YOUTUBE_API_KEY:
-    raise RuntimeError("ENV yo‘q")
+    raise RuntimeError("BOT_TOKEN yoki YOUTUBE_API_KEYS yo‘q")
 
 BOT_TOKEN = BOT_TOKEN.strip()
 YOUTUBE_API_KEY = YOUTUBE_API_KEY.strip()
 # =====================================
 
+
 # ================= CONFIG ==============
 CREDIT_DAILY = 5
 TTL_VIDEO = 6 * 3600
 # =====================================
+
 
 # ================= DATABASE ============
 conn = sqlite3.connect("bot.db")
@@ -59,10 +66,11 @@ cur.execute("""CREATE TABLE IF NOT EXISTS categories (
 conn.commit()
 # =====================================
 
+
 # ================= HELPERS =============
 YOUTUBE_REGEX = r"(https?://(?:www\.)?(?:youtube\.com|youtu\.be)/\S+)"
 
-def extract_video_id(url):
+def extract_video_id(url: str):
     for p in [r"v=([^&]+)", r"youtu\.be/([^?]+)", r"shorts/([^?]+)"]:
         m = re.search(p, url)
         if m:
@@ -83,12 +91,18 @@ def split_text(text, limit=4000):
     return [text[i:i+limit] for i in range(0, len(text), limit)]
 # =====================================
 
+
 # ================= CATEGORY ============
 def preload_categories():
     cur.execute("SELECT COUNT(*) FROM categories")
     if cur.fetchone()[0] > 0:
         return
-    data = yt_api("videoCategories", {"part": "snippet", "regionCode": "US"})
+
+    data = yt_api("videoCategories", {
+        "part": "snippet",
+        "regionCode": "US"
+    })
+
     for it in data.get("items", []):
         cur.execute(
             "INSERT OR IGNORE INTO categories VALUES (?,?)",
@@ -97,12 +111,15 @@ def preload_categories():
     conn.commit()
 
 def resolve_category(cat_id):
+    if not cat_id:
+        return "Unknown"
     cur.execute("SELECT name FROM categories WHERE category_id=?", (cat_id,))
     row = cur.fetchone()
     return row[0] if row else "Unknown"
 # =====================================
 
-# ================= CREDIT (FIXED) ======
+
+# ================= CREDIT ==============
 def get_credit(uid):
     now = int(time.time())
     cur.execute("SELECT credit, last_reset FROM users WHERE user_id=?", (uid,))
@@ -124,6 +141,7 @@ def get_credit(uid):
             (credit, now, uid)
         )
         conn.commit()
+
     return credit
 
 def use_credit(uid):
@@ -133,6 +151,7 @@ def use_credit(uid):
     )
     conn.commit()
 # =====================================
+
 
 # ================= NAKRUTKA ===========
 def detect_like_fraud(views, likes, comments, hours):
@@ -144,15 +163,26 @@ def detect_like_fraud(views, likes, comments, hours):
 
     if likes > views:
         return "🔴 LIKE NAKRUTKA (LIKELAR VIEWDAN KO‘P)"
+
     if like_ratio >= 0.30:
         return f"🔴 LIKE NAKRUTKA ({like_ratio*100:.0f}%)"
+
     if like_ratio >= 0.20 and comment_ratio < 0.002:
         return "🟠 SHUBHALI FAOLLIGI"
+
+    if hours < 3 and views > 5000 and like_ratio > 0.15:
+        return "🟠 TEZ SUN’IY O‘SISH"
+
     return "🟢 NORMAL FAOLLIGI"
 # =====================================
 
+
+# ================= BOT SETUP ===========
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
+router = Router()
+# =====================================
+
 
 def result_kb(vid):
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -161,6 +191,8 @@ def result_kb(vid):
         [InlineKeyboardButton(text="🏷 TAG / TAVSIF", callback_data=f"tags:{vid}")]
     ])
 
+
+# ================= MESSAGE HANDLERS ====
 @dp.message(Command("start"))
 async def start(m: Message):
     preload_categories()
@@ -171,17 +203,16 @@ async def start(m: Message):
         "👉 YouTube linkni yuboring"
     )
 
-# ================= ANALYZE (KREDIT FIXED) ========
+
 @dp.message(F.text.regexp(YOUTUBE_REGEX))
 async def analyze(m: Message):
     uid = m.from_user.id
-
     credit = get_credit(uid)
+
     if credit <= 0:
         await m.answer("❌ Kredit tugagan. 24 soatda yangilanadi.")
         return
 
-    # 🔒 MUHIM: HAR ANALIZ = 1 KREDIT
     use_credit(uid)
 
     vid = extract_video_id(m.text)
@@ -193,7 +224,11 @@ async def analyze(m: Message):
     row = cur.fetchone()
 
     if not row or now_ts - row[-1] > TTL_VIDEO:
-        data = yt_api("videos", {"part": "snippet,statistics", "id": vid})
+        data = yt_api("videos", {
+            "part": "snippet,statistics",
+            "id": vid
+        })
+
         it = data["items"][0]
         sn, st = it["snippet"], it["statistics"]
 
@@ -217,21 +252,7 @@ async def analyze(m: Message):
             now_ts
         ))
         conn.commit()
-
-        row = (
-            vid,
-            sn["title"],
-            sn["channelTitle"],
-            sn["channelId"],
-            category,
-            sn["publishedAt"],
-            int(st.get("viewCount", 0)),
-            int(st.get("likeCount", 0)),
-            int(st.get("commentCount", 0)),
-            ", ".join(sn.get("tags", [])),
-            sn.get("description", ""),
-            now_ts
-        )
+        row = cur.execute("SELECT * FROM videos WHERE video_id=?", (vid,)).fetchone()
 
     _, title, channel, cid, category, published, views, likes, comments, tags, desc, _ = row
 
@@ -253,8 +274,84 @@ async def analyze(m: Message):
     )
 # =====================================
 
+
+# ================= CALLBACK HANDLERS ===
+@router.callback_query(F.data.startswith("top:"))
+async def top_videos(c: CallbackQuery):
+    vid = c.data.split(":")[1]
+    title = cur.execute(
+        "SELECT title FROM videos WHERE video_id=?",
+        (vid,)
+    ).fetchone()[0]
+
+    data = yt_api("search", {
+        "part": "snippet",
+        "type": "video",
+        "order": "viewCount",
+        "maxResults": 10,
+        "publishedAfter": (datetime.utcnow()-timedelta(days=30)).isoformat()+"Z",
+        "q": title
+    })
+
+    text = "🧠 TOP 10 KONKURENT VIDEO:\n\n"
+    for i, it in enumerate(data.get("items", [])[:10], 1):
+        text += f"{i}. {it['snippet']['title']}\nhttps://youtu.be/{it['id']['videoId']}\n\n"
+
+    await c.message.answer(text)
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("channels:"))
+async def channels(c: CallbackQuery):
+    vid = c.data.split(":")[1]
+    title = cur.execute(
+        "SELECT title FROM videos WHERE video_id=?",
+        (vid,)
+    ).fetchone()[0]
+
+    data = yt_api("search", {
+        "part": "snippet",
+        "type": "channel",
+        "maxResults": 5,
+        "q": title
+    })
+
+    text = "📺 RAQOBATCHI KANALLAR (TOP 5):\n\n"
+    for i, it in enumerate(data.get("items", [])[:5], 1):
+        text += f"{i}. {it['snippet']['channelTitle']} — https://youtube.com/channel/{it['id']['channelId']}\n"
+
+    await c.message.answer(text)
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("tags:"))
+async def tags(c: CallbackQuery):
+    vid = c.data.split(":")[1]
+    vtags, desc, cid = cur.execute(
+        "SELECT tags, description, channel_id FROM videos WHERE video_id=?",
+        (vid,)
+    ).fetchone()
+
+    data = yt_api("channels", {
+        "part": "brandingSettings",
+        "id": cid
+    })
+    ctags = data["items"][0]["brandingSettings"]["channel"].get("keywords", "")
+
+    await c.message.answer("🏷 VIDEO TAGLAR:\n```\n"+vtags+"\n```", parse_mode="Markdown")
+    await c.message.answer("🏷 KANAL TAGLAR:\n```\n"+ctags+"\n```", parse_mode="Markdown")
+
+    for part in split_text(desc):
+        await c.message.answer("📝 DESCRIPTION:\n```\n"+part+"\n```", parse_mode="Markdown")
+
+    await c.answer()
+# =====================================
+
+
+# ================= MAIN ================
 async def main():
-    print("🤖 BOT ISHLAYAPTI (KREDIT FIXED)")
+    dp.include_router(router)
+    print("🤖 BOT ISHLAYAPTI — FINAL, BARQAROR")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
