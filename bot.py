@@ -16,10 +16,9 @@ from aiogram.filters import Command
 
 # ================= ENV =================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = os.getenv("ADMIN_ID")
 
 if not BOT_TOKEN:
-    raise RuntimeError("❌ BOT_TOKEN topilmadi. Railway Variables ni tekshir!")
+    raise RuntimeError("BOT_TOKEN topilmadi (Railway Variables ni tekshir)")
 
 BOT_TOKEN = BOT_TOKEN.strip()
 # ======================================
@@ -43,6 +42,8 @@ conn.commit()
 
 
 # ================= HELPERS ================
+YOUTUBE_REGEX = r"(https?://(?:www\.)?(?:youtube\.com|youtu\.be)/\S+)"
+
 def extract_video_id(url: str):
     patterns = [
         r"v=([^&]+)",
@@ -74,21 +75,17 @@ dp = Dispatcher()
 async def start(message: Message):
     await message.answer(
         "👋 Xush kelibsiz!\n\n"
-        "📊 YouTube analiz bot\n"
-        "/analyze <youtube_url>"
+        "📊 YouTube analiz bot\n\n"
+        "👉 Shunchaki YouTube linkni yuboring.\n"
+        "Bot o‘zi analiz qiladi 🚀"
     )
 
 
-@dp.message(Command("analyze"))
-async def analyze(message: Message):
-    args = message.text.split(maxsplit=1)
-    if len(args) < 2:
-        await message.answer("❗ YouTube link yuboring")
-        return
-
-    video_id = extract_video_id(args[1])
+# ---------- ANALIZ FUNKSIYA (UMUMIY) ----------
+async def process_video(message: Message, url: str):
+    video_id = extract_video_id(url)
     if not video_id:
-        await message.answer("❌ Noto‘g‘ri YouTube link")
+        await message.answer("❌ YouTube linkni taniy olmadim")
         return
 
     sid = short_id(video_id)
@@ -116,11 +113,30 @@ async def analyze(message: Message):
     await message.answer(
         f"🎬 Video ID: {video_id}\n"
         f"📊 Analiz tayyor\n\n"
-        f"👇 TOP 5 ni ko‘rish:",
+        f"👇 Natijani ko‘rish:",
         reply_markup=keyboard
     )
 
 
+# ---------- /analyze QOLADI ----------
+@dp.message(Command("analyze"))
+async def analyze_cmd(message: Message):
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer("❗ YouTube link yuboring")
+        return
+    await process_video(message, args[1])
+
+
+# ---------- ODDIY LINK YUBORILGANDA ----------
+@dp.message(F.text.regexp(YOUTUBE_REGEX))
+async def analyze_from_text(message: Message):
+    match = re.search(YOUTUBE_REGEX, message.text)
+    if match:
+        await process_video(message, match.group(1))
+
+
+# ---------- CALLBACK ----------
 @dp.callback_query(F.data.startswith("top5:"))
 async def show_top5(callback: CallbackQuery):
     sid = callback.data.split(":")[1]
