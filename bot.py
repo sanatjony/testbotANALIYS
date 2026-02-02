@@ -21,7 +21,17 @@ bot = Bot(
 )
 dp = Dispatcher()
 
-# ================= DB =================
+TZ_TASHKENT = timezone(timedelta(hours=5))
+
+# ================= CATEGORY MAP =================
+CATEGORY_MAP = {
+    "20": ("Gaming", "Игры", "O‘yinlar"),
+    "24": ("Entertainment", "Развлечения", "Ko‘ngilochar"),
+    "22": ("People & Blogs", "Люди и блоги", "Bloglar"),
+    "10": ("Music", "Музыка", "Musiqa"),
+}
+
+# ================= DB + RAM =================
 db = sqlite3.connect("cache.db", check_same_thread=False)
 cur = db.cursor()
 cur.execute("""
@@ -36,17 +46,14 @@ db.commit()
 RAM = {}
 CACHE_TTL = 3600
 
-# ================= HELPERS =================
 def cache_get(key):
     if key in RAM:
         return RAM[key]
     cur.execute("SELECT data, ts FROM cache WHERE key=?", (key,))
-    row = cur.fetchone()
-    if not row:
+    r = cur.fetchone()
+    if not r or time.time() - r[1] > CACHE_TTL:
         return None
-    if time.time() - row[1] > CACHE_TTL:
-        return None
-    data = json.loads(row[0])
+    data = json.loads(r[0])
     RAM[key] = data
     return data
 
@@ -58,6 +65,7 @@ def cache_set(key, data):
     )
     db.commit()
 
+# ================= YT HELPERS =================
 def yt(endpoint, params):
     for k in API_KEYS:
         try:
@@ -77,9 +85,20 @@ def extract_video_id(url):
     m = re.search(r"(v=|be/)([\w\-]{11})", url)
     return m.group(2) if m else None
 
-def to_tashkent_time(iso):
+def tashkent_time(iso):
     dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
-    return dt.astimezone(timezone(timedelta(hours=5))).strftime("%d.%m.%Y %H:%M")
+    return dt.astimezone(TZ_TASHKENT).strftime("%d.%m.%Y %H:%M")
+
+# ================= NAKRUTKA =================
+def like_nakrutka(views, likes):
+    if views == 0:
+        return "⚪ Maʼlumot yetarli emas"
+    r = likes / views
+    if r > 0.3:
+        return "🔴 Nakrutka ehtimoli yuqori"
+    if r > 0.15:
+        return "🟡 Shubhali"
+    return "🟢 Normal"
 
 # ================= VIDEO =================
 def get_video(video_id):
@@ -94,24 +113,27 @@ def get_video(video_id):
     })
     it = js["items"][0]
 
+    cat_id = it["snippet"].get("categoryId")
+    cat = CATEGORY_MAP.get(cat_id, ("—", "—", "—"))
+
     data = {
         "id": video_id,
         "title": it["snippet"]["title"],
         "desc": it["snippet"].get("description", ""),
         "thumb": it["snippet"]["thumbnails"]["high"]["url"],
-        "published": to_tashkent_time(it["snippet"]["publishedAt"]),
+        "published": tashkent_time(it["snippet"]["publishedAt"]),
         "views": int(it["statistics"].get("viewCount", 0)),
         "likes": int(it["statistics"].get("likeCount", 0)),
         "comments": int(it["statistics"].get("commentCount", 0)),
-        "channel_id": it["snippet"]["channelId"],
-        "channel": it["snippet"]["channelTitle"]
+        "channel": it["snippet"]["channelTitle"],
+        "category": cat
     }
 
     cache_set(key, data)
     return data
 
-# ================= SEARCH (views bilan) =================
-def search_top_videos(query, days=30, limit=10):
+# ================= SEARCH =================
+def search_top_videos(query, days=30, limit=25):
     key = f"search:{query}:{days}"
     cached = cache_get(key)
     if cached:
@@ -147,14 +169,6 @@ def search_top_videos(query, days=30, limit=10):
     cache_set(key, out)
     return out
 
-# ================= CHANNEL NAMES =================
-def get_channel_names(channel_ids):
-    js = yt("channels", {
-        "part": "snippet",
-        "id": ",".join(channel_ids)
-    })
-    return {i["id"]: i["snippet"]["title"] for i in js["items"]}
-
 # ================= BOT =================
 @dp.message(CommandStart())
 async def start(m: Message):
@@ -169,11 +183,17 @@ async def handle(m: Message):
     msg = await m.answer("⏳ Analiz qilinmoqda...")
     data = await asyncio.to_thread(get_video, vid)
 
+    nak = like_nakrutka(data["views"], data["likes"])
+    cat = data["category"]
+
     text = (
         f"🎬 <b>{data['title']}</b>\n\n"
         f"🕒 Yuklangan: {data['published']} (Toshkent vaqti)\n"
-        f"📺 Kanal: {data['channel']}\n\n"
-        f"👁 {data['views']}   👍 {data['likes']}   💬 {data['comments']}"
+        f"📺 Kanal: {data['channel']}\n"
+        f"📂 Kategoriya:\n"
+        f"🇬🇧 {cat[0]} / 🇷🇺 {cat[1]} / 🇺🇿 {cat[2]}\n\n"
+        f"👁 {data['views']}   👍 {data['likes']}   💬 {data['comments']}\n"
+        f"⚠️ Likelar soni {nak}"
     )
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -190,7 +210,7 @@ async def cb_titles(c: CallbackQuery):
     vid = c.data.split(":")[1]
     data = get_video(vid)
 
-    res = await asyncio.to_thread(search_top_videos, data["title"], 30, 10)
+    res = await asyncio.to_thread(search_top_videos, data["title"], 30, 25)
 
     lines = [
         f"{i+1}. {r['title']}\n👁 {r['views']:,}"
@@ -226,10 +246,16 @@ async def cb_channels(c: CallbackQuery):
         "maxResults": 15
     })
 
-    ch_ids = list({i["snippet"]["channelId"] for i in js["items"]})
-    names = get_channel_names(ch_ids)
+    channel_ids = list({i["snippet"]["channelId"] for i in js["items"]})
 
-    out = [f"{i+1}. {names[cid]}" for i, cid in enumerate(ch_ids[:10])]
+    ch_js = yt("channels", {
+        "part": "snippet",
+        "id": ",".join(channel_ids)
+    })
+
+    names = [i["snippet"]["title"] for i in ch_js["items"]]
+
+    out = [f"{i+1}. {name}" for i, name in enumerate(names[:10])]
 
     await c.message.answer(
         "<b>📺 RAQOBATCHI KANALLAR (TOP)</b>\n\n" + "\n".join(out)
