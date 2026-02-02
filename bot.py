@@ -3,174 +3,186 @@ import re
 import asyncio
 import requests
 from collections import Counter
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
+from aiogram.enums import ParseMode
 
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-
-# ================= ENV =================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
+YT_API_KEY = os.getenv("YT_API_KEY")
 
-if not BOT_TOKEN or not YOUTUBE_API_KEY:
-    raise RuntimeError("ENV xato")
-
-bot = Bot(BOT_TOKEN)
+bot = Bot(BOT_TOKEN, parse_mode=ParseMode.HTML)
 dp = Dispatcher()
 
-# ================= CONFIG =================
-BANNED = {"hack", "crack", "cheat", "free download", "mod apk"}
+# ===================== UTILS =====================
 
-TRIGGERS = [
-    "vs", "challenge", "experiment", "gameplay",
-    "insane", "crazy", "unexpected", "extreme"
-]
+def extract_video_id(url: str):
+    patterns = [
+        r"v=([a-zA-Z0-9_-]{11})",
+        r"youtu\.be/([a-zA-Z0-9_-]{11})",
+        r"/shorts/([a-zA-Z0-9_-]{11})"
+    ]
+    for p in patterns:
+        m = re.search(p, url)
+        if m:
+            return m.group(1)
+    return None
 
-# ================= HELPERS =================
-def get_video_id(url: str):
-    m = re.search(r"(v=|youtu\.be/|/live/)([^&?/]+)", url)
-    return m.group(2) if m else None
 
-def yt_video(video_id: str):
-    url = (
-        "https://www.googleapis.com/youtube/v3/videos"
-        f"?part=snippet&id={video_id}&key={YOUTUBE_API_KEY}"
-    )
-    return requests.get(url, timeout=10).json()["items"][0]
+def clean_words(text):
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9\s]", " ", text)
+    words = [w for w in text.split() if len(w) > 3]
+    return words
 
-def yt_search(query: str, limit=40):
-    url = (
-        "https://www.googleapis.com/youtube/v3/search"
-        f"?part=snippet&type=video&q={query}"
-        f"&maxResults={limit}&key={YOUTUBE_API_KEY}"
-    )
-    return requests.get(url, timeout=10).json().get("items", [])
 
-def extract_phrases(text: str):
-    words = re.findall(r"[A-Za-z0-9]{3,}", text.lower())
+def build_phrases(words, n=3):
     phrases = []
-
-    for size in (1, 2, 3, 4):
-        for i in range(len(words) - size + 1):
-            phrase = " ".join(words[i:i+size])
-            if not any(b in phrase for b in BANNED):
-                phrases.append(phrase)
-
+    for i in range(len(words) - n + 1):
+        phrases.append(" ".join(words[i:i+n]))
     return phrases
 
-# ================= START =================
-@dp.message(Command("start"))
-async def start_cmd(message: types.Message):
-    await message.answer(
-        "🧪 *YouTube Analyser — TEST*\n\n"
-        "YouTube video link yuboring\n"
-        "✍️ AI Title | 🏷 AI Tags",
-        parse_mode="Markdown"
-    )
 
-# ================= MAIN =================
-@dp.message()
-async def handle_video(message: types.Message):
-    vid = get_video_id(message.text or "")
-    if not vid:
-        await message.answer("❌ YouTube link noto‘g‘ri.")
-        return
+# ===================== YOUTUBE =====================
 
-    video = yt_video(vid)
-    title = video["snippet"]["title"]
-    channel = video["snippet"]["channelTitle"]
+def get_video_info(video_id):
+    url = "https://www.googleapis.com/youtube/v3/videos"
+    params = {
+        "key": YT_API_KEY,
+        "part": "snippet,statistics",
+        "id": video_id
+    }
+    r = requests.get(url, params=params).json()
+    if not r["items"]:
+        return None
+    return r["items"][0]
 
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✍️ AI Title", callback_data=f"titleai:{vid}"),
-                InlineKeyboardButton(text="🏷 AI Tags", callback_data=f"tagai:{vid}")
-            ]
-        ]
-    )
 
-    await message.answer(
-        f"🎬 *Mavjud video nomi:*\n{title}\n\n"
-        f"📺 Kanal: {channel}\n\n"
-        "👇 Kerakli AI funksiyani tanlang",
-        parse_mode="Markdown",
-        reply_markup=keyboard
-    )
+def youtube_search(query, max_results=30):
+    url = "https://www.googleapis.com/youtube/v3/search"
+    params = {
+        "key": YT_API_KEY,
+        "part": "snippet",
+        "q": query,
+        "type": "video",
+        "maxResults": max_results
+    }
+    return requests.get(url, params=params).json().get("items", [])
 
-# ================= AI TITLE =================
-@dp.callback_query(F.data.startswith("titleai:"))
-async def title_ai_cb(call: types.CallbackQuery):
-    vid = call.data.split(":")[1]
-    video = yt_video(vid)
 
-    base_title = video["snippet"]["title"]
-    items = yt_search(base_title)
+# ===================== AI CORE =====================
 
-    phrases = []
-    for i in items:
-        phrases.extend(extract_phrases(i["snippet"]["title"]))
+def generate_semantic_tags(base_title):
+    search_results = youtube_search(base_title)
 
-    if not phrases:
-        phrases = extract_phrases(base_title)
+    pool = []
+    for item in search_results:
+        title = item["snippet"]["title"]
+        desc = item["snippet"].get("description", "")
+        pool += clean_words(title)
+        pool += clean_words(desc)
 
-    core = [p for p, _ in Counter(phrases).most_common(5)]
-
-    titles = []
-    for c in core:
-        for t in TRIGGERS:
-            new = f"{c.title()} {t.title()} | {base_title.split('|')[0]}"
-            if 45 <= len(new) <= 90:
-                titles.append(new)
-            if len(titles) >= 5:
-                break
-
-    text = "✍️ *AI tavsiya qilgan clickbait titellar*\n\n"
-    for i, t in enumerate(titles, 1):
-        text += f"{i}. {t}\n\n"
-
-    await call.message.answer(text, parse_mode="Markdown")
-    await call.answer()
-
-# ================= AI TAGS =================
-@dp.callback_query(F.data.startswith("tagai:"))
-async def tag_ai_cb(call: types.CallbackQuery):
-    vid = call.data.split(":")[1]
-    video = yt_video(vid)
-
-    base_title = video["snippet"]["title"]
-    items = yt_search(base_title)
+    phrases = build_phrases(pool, 2) + build_phrases(pool, 3)
+    counter = Counter(phrases)
 
     tags = []
+    for phrase, count in counter.most_common(40):
+        if base_title.split()[0].lower() in phrase:
+            tags.append(phrase)
 
-    # 1️⃣ Search title'lardan
-    for i in items:
-        tags.extend(extract_phrases(i["snippet"]["title"]))
+    return tags[:25]
 
-    # 2️⃣ Asl title fallback
-    if not tags:
-        tags.extend(extract_phrases(base_title))
 
-    # 3️⃣ Trigger bilan kengaytirish
-    expanded = []
-    for t in tags[:10]:
-        for trig in TRIGGERS:
-            expanded.append(f"{t} {trig}")
+def generate_ai_titles(original_title, tags):
+    base = original_title.split("|")[0].strip()
 
-    all_tags = tags + expanded
-    final_tags = [t for t, _ in Counter(all_tags).most_common(20)]
+    hooks = [
+        "You Won’t Believe",
+        "This Changed Everything",
+        "INSANE",
+        "Unexpected",
+        "Extreme",
+        "Most Realistic",
+        "People Are Shocked By"
+    ]
+
+    titles = []
+    for i, hook in enumerate(hooks):
+        if i >= 5:
+            break
+        t = f"{hook} {base} | {tags[0].title()}"
+        titles.append(t)
+
+    return titles
+
+
+# ===================== HANDLERS =====================
+
+@dp.message(F.text.startswith("http"))
+async def handle_video(message: Message):
+    vid = extract_video_id(message.text)
+    if not vid:
+        await message.answer("❌ Video link noto‘g‘ri.")
+        return
+
+    info = get_video_info(vid)
+    if not info:
+        await message.answer("❌ Video topilmadi.")
+        return
+
+    title = info["snippet"]["title"]
+    channel = info["snippet"]["channelTitle"]
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🧠 AI Title", callback_data=f"title:{vid}"),
+            InlineKeyboardButton(text="🏷 AI Tags", callback_data=f"tags:{vid}")
+        ]
+    ])
+
+    await message.answer(
+        f"🎬 <b>Mavjud video nomi:</b>\n{title}\n\n📺 <b>Kanal:</b> {channel}\n\n👇 Kerakli AI funksiyani tanlang",
+        reply_markup=kb
+    )
+
+
+@dp.callback_query(F.data.startswith("tags:"))
+async def ai_tags(cb: CallbackQuery):
+    vid = cb.data.split(":")[1]
+    info = get_video_info(vid)
+    title = info["snippet"]["title"]
+
+    tags = generate_semantic_tags(title)
 
     text = (
-        "🏷 *AI tavsiya qilgan top taglar*\n\n"
-        "```\n" + ", ".join(final_tags) + "\n```\n\n"
+        "🏷 <b>AI tavsiya qilgan TOP TAGLAR</b>\n\n"
+        "<code>" + ", ".join(tags) + "</code>\n\n"
         "📈 CTR + Search uchun mos"
     )
 
-    await call.message.answer(text, parse_mode="Markdown")
-    await call.answer()
+    await cb.message.answer(text)
+    await cb.answer()
 
-# ================= RUN =================
+
+@dp.callback_query(F.data.startswith("title:"))
+async def ai_titles(cb: CallbackQuery):
+    vid = cb.data.split(":")[1]
+    info = get_video_info(vid)
+    title = info["snippet"]["title"]
+
+    tags = generate_semantic_tags(title)
+    titles = generate_ai_titles(title, tags)
+
+    text = "🧠 <b>AI tavsiya qilgan CLICKBAIT TITLAR</b>\n\n"
+    for i, t in enumerate(titles, 1):
+        text += f"{i}. {t}\n"
+
+    await cb.message.answer(text)
+    await cb.answer()
+
+
+# ===================== START =====================
+
 async def main():
-    print("TEST bot ishga tushdi (AI TAG FIXED)")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
