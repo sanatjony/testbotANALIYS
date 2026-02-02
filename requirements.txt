@@ -1,0 +1,6 @@
+aiogram
+requests
+pytz
+pytrends
+matplotlib
+pandas
