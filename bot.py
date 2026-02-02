@@ -1,6 +1,9 @@
 import os
 import re
+import json
+import time
 import asyncio
+import sqlite3
 import requests
 from datetime import datetime, timedelta, timezone
 
@@ -16,14 +19,25 @@ dp = Dispatcher()
 
 YOUTUBE_API = "https://www.googleapis.com/youtube/v3"
 
-# ---------- HELPERS ----------
+# ================= CACHE =================
+RAM_CACHE = {}   # video_id -> data
+CACHE_TTL = 60 * 60 * 24  # 24 soat
 
-def extract_video_id(url: str):
-    patterns = [
-        r"v=([a-zA-Z0-9_-]{11})",
-        r"youtu\.be/([a-zA-Z0-9_-]{11})"
-    ]
-    for p in patterns:
+# ================= DB =================
+conn = sqlite3.connect("cache.db", check_same_thread=False)
+cur = conn.cursor()
+cur.execute("""
+CREATE TABLE IF NOT EXISTS cache (
+    video_id TEXT PRIMARY KEY,
+    data TEXT,
+    created_at INTEGER
+)
+""")
+conn.commit()
+
+# ================= HELPERS =================
+def extract_video_id(url):
+    for p in [r"v=([A-Za-z0-9_-]{11})", r"youtu\.be/([A-Za-z0-9_-]{11})"]:
         m = re.search(p, url)
         if m:
             return m.group(1)
@@ -37,10 +51,38 @@ def yt(endpoint, params):
     return r.json()
 
 
-# ---------- CORE LOGIC ----------
+def cache_get(video_id):
+    now = int(time.time())
 
-def get_video_and_competitors(video_id: str):
-    # 1️⃣ Video info
+    # RAM
+    if video_id in RAM_CACHE:
+        data, ts = RAM_CACHE[video_id]
+        if now - ts < CACHE_TTL:
+            return data
+
+    # DB
+    cur.execute("SELECT data, created_at FROM cache WHERE video_id=?", (video_id,))
+    row = cur.fetchone()
+    if row and now - row[1] < CACHE_TTL:
+        data = json.loads(row[0])
+        RAM_CACHE[video_id] = (data, row[1])
+        return data
+
+    return None
+
+
+def cache_set(video_id, data):
+    ts = int(time.time())
+    RAM_CACHE[video_id] = (data, ts)
+    cur.execute(
+        "REPLACE INTO cache(video_id, data, created_at) VALUES(?,?,?)",
+        (video_id, json.dumps(data), ts)
+    )
+    conn.commit()
+
+# ================= CORE ANALYSIS =================
+def analyze_video(video_id):
+    # video info
     v = yt("videos", {
         "part": "snippet,statistics",
         "id": video_id
@@ -51,32 +93,33 @@ def get_video_and_competitors(video_id: str):
 
     video = v[0]
     title = video["snippet"]["title"]
-    channel_title = video["snippet"]["channelTitle"]
-
-    # asosiy keyword (oddiy, ammo samarali)
     keyword = title.split("|")[0].split("-")[0][:60]
 
-    # 2️⃣ BITTA search.list — HAMMA ANALIZ SHU YERDA
-    published_after = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+    published_after = (
+        datetime.now(timezone.utc) - timedelta(days=30)
+    ).isoformat()
 
     search = yt("search", {
         "part": "snippet",
         "type": "video",
         "q": keyword,
         "order": "viewCount",
-        "maxResults": 25,
+        "maxResults": 15,
         "publishedAfter": published_after
     })["items"]
 
     competitors = []
     channels = {}
-    used_titles = set()
+    used = set()
 
-    for item in search:
-        vid = item["id"]["videoId"]
-        sn = item["snippet"]
+    for it in search:
+        vid = it["id"]["videoId"]
+        t = it["snippet"]["title"]
 
-        # views olish
+        if t.lower() in used:
+            continue
+        used.add(t.lower())
+
         stats = yt("videos", {
             "part": "statistics",
             "id": vid
@@ -86,51 +129,35 @@ def get_video_and_competitors(video_id: str):
             continue
 
         views = int(stats[0]["statistics"].get("viewCount", 0))
-        t = sn["title"]
+        competitors.append({"title": t, "views": views})
 
-        if t.lower() in used_titles:
-            continue
-
-        used_titles.add(t.lower())
-
-        competitors.append({
-            "title": t,
-            "views": views
-        })
-
-        ch = sn["channelTitle"]
+        ch = it["snippet"]["channelTitle"]
         channels[ch] = channels.get(ch, 0) + 1
 
         if len(competitors) >= 10:
             break
 
-    # sort views
     competitors.sort(key=lambda x: x["views"], reverse=True)
 
     return {
         "video_title": title,
-        "channel": channel_title,
         "views": video["statistics"].get("viewCount"),
         "likes": video["statistics"].get("likeCount"),
         "comments": video["statistics"].get("commentCount"),
         "keyword": keyword,
         "competitors": competitors,
-        "channels": sorted(channels.items(), key=lambda x: x[1], reverse=True)[:10]
+        "channels": sorted(channels.items(), key=lambda x: x[1], reverse=True)[:5]
     }
 
-
-# ---------- HANDLERS ----------
-
+# ================= HANDLERS =================
 @dp.message(CommandStart())
 async def start(msg: Message):
     await msg.answer(
-        "👋 Salom!\n"
-        "YouTube video linkini yubor.\n\n"
-        "Men:\n"
-        "🧠 TOP nomlar (konkurent asosida)\n"
-        "🏷 TOP taglar\n"
-        "📺 Raqobatchi kanallar\n"
-        "chiqarib beraman."
+        "👋 Salom!\n\n"
+        "YouTube video linkini yuboring.\n\n"
+        "⚡ Juda tez ishlaydi\n"
+        "📉 Limitni tejaydi\n"
+        "🧠 Cache bilan"
     )
 
 
@@ -138,28 +165,23 @@ async def start(msg: Message):
 async def handle_video(msg: Message):
     vid = extract_video_id(msg.text)
     if not vid:
-        await msg.answer("❌ Video link noto‘g‘ri.")
-        return
+        return await msg.answer("❌ Link noto‘g‘ri.")
 
-    wait = await msg.answer("⏳ Video analiz qilinmoqda, iltimos kuting...")
+    cached = cache_get(vid)
+    if cached:
+        data = cached
+    else:
+        wait = await msg.answer("⏳ Video analiz qilinmoqda...")
+        try:
+            data = await asyncio.to_thread(analyze_video, vid)
+        except Exception:
+            return await wait.edit_text("❌ API vaqtincha cheklangan.")
 
-    try:
-        data = await asyncio.to_thread(get_video_and_competitors, vid)
-    except Exception as e:
-        await wait.edit_text("❌ Video topilmadi yoki API cheklangan.")
-        return
+        if not data:
+            return await wait.edit_text("❌ Video topilmadi.")
 
-    if not data:
-        await wait.edit_text("❌ Video topilmadi.")
-        return
-
-    text = (
-        f"🎬 {data['video_title']}\n\n"
-        f"👁 View: {data['views']}\n"
-        f"👍 Like: {data['likes']}\n"
-        f"💬 Comment: {data['comments']}\n\n"
-        f"👇 Kerakli funksiyani tanlang:"
-    )
+        cache_set(vid, data)
+        await wait.delete()
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -171,65 +193,56 @@ async def handle_video(msg: Message):
         ]
     ])
 
-    await wait.edit_text(text, reply_markup=kb)
+    await msg.answer(
+        f"🎬 {data['video_title']}\n\n"
+        f"👁 {data['views']} | 👍 {data['likes']} | 💬 {data['comments']}",
+        reply_markup=kb
+    )
 
 
 @dp.callback_query(F.data.startswith("titles:"))
 async def cb_titles(cb):
     vid = cb.data.split(":")[1]
-    data = await asyncio.to_thread(get_video_and_competitors, vid)
+    data = cache_get(vid)
 
-    lines = []
+    text = "🧠 TOP KONKURENT NOMLAR (30 kun):\n\n"
     for i, c in enumerate(data["competitors"], 1):
-        lines.append(f"{i}. {c['title']} — 👁 {c['views']:,}")
+        text += f"{i}. {c['title']}\n👁 {c['views']:,}\n\n"
 
-    await cb.message.answer(
-        "🧠 OXIRGI 30 KUN — KONKURENT TOP NOMLARI:\n\n" + "\n".join(lines)
-    )
+    await cb.message.answer(text)
 
 
 @dp.callback_query(F.data.startswith("tags:"))
 async def cb_tags(cb):
     vid = cb.data.split(":")[1]
-    data = await asyncio.to_thread(get_video_and_competitors, vid)
+    data = cache_get(vid)
 
-    base = data["keyword"].lower().replace(",", "")
-    tags = list(dict.fromkeys([
-        base,
-        "beamng drive",
-        "mcqueen",
-        "pixar cars",
-        "truck challenge",
-        "viral gameplay",
-        "satisfying",
-        "crash test",
-        "cars toys",
-        "kids cars"
-    ]))
+    tags = [
+        data["keyword"],
+        "viral",
+        "challenge",
+        "gameplay",
+        "trending",
+        "youtube shorts"
+    ]
 
-    await cb.message.answer(
-        "🏷 TOP TAGLAR (copy-paste):\n\n" + ", ".join(tags)
-    )
+    await cb.message.answer("🏷 TOP TAGLAR:\n\n" + ", ".join(dict.fromkeys(tags)))
 
 
 @dp.callback_query(F.data.startswith("channels:"))
 async def cb_channels(cb):
     vid = cb.data.split(":")[1]
-    data = await asyncio.to_thread(get_video_and_competitors, vid)
+    data = cache_get(vid)
 
-    lines = []
-    for i, (ch, cnt) in enumerate(data["channels"], 1):
-        lines.append(f"{i}. {ch} — {cnt} video")
+    text = "📺 RAQOBATCHI KANALLAR:\n\n"
+    for i, (c, n) in enumerate(data["channels"], 1):
+        text += f"{i}. {c} — {n} video\n"
 
-    await cb.message.answer(
-        "📺 RAQOBATCHI KANALLAR (TOP):\n\n" + "\n".join(lines)
-    )
+    await cb.message.answer(text)
 
-
-# ---------- RUN ----------
-
+# ================= RUN =================
 async def main():
-    print("🤖 TEST BOT ishga tushdi")
+    print("🤖 BOT ishga tushdi (CACHE ON)")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
