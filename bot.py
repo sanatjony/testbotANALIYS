@@ -1,5 +1,6 @@
 import os, re, asyncio, requests
 from difflib import SequenceMatcher
+from collections import Counter
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
@@ -38,51 +39,96 @@ def extract_video_id(url):
 def similarity(a, b):
     return SequenceMatcher(None, a.lower(), b.lower()).ratio()
 
-def clean_title(t):
+def clean(t):
     return re.sub(r"[^\w\s]", "", t).strip()
 
-# ================= SEARCH & TITLE ANALYSIS =================
+def words(t):
+    return re.findall(r"[a-zA-Z]{3,}", t.lower())
+
+# ================= VIDEO TYPE =================
+def detect_type(title):
+    t = title.lower()
+    if any(x in t for x in ["beamng", "gameplay", "vs", "challenge", "experiment"]):
+        return "gaming"
+    if any(x in t for x in ["unboxing", "review", "toys", "cars", "mcqueen", "pixar"]):
+        return "unboxing"
+    if any(x in t for x in ["lyrics", "song", "music"]):
+        return "music"
+    return "general"
+
+# ================= SEARCH =================
 def search_titles(keyword):
     data = yt("search", {
         "part": "snippet",
         "q": keyword,
         "type": "video",
-        "maxResults": 30
+        "maxResults": 25
     })
     return [v["snippet"]["title"] for v in data.get("items", [])]
 
-def ctr_boost(title):
-    """
-    CTR oshirish uchun kichik optimizatsiya
-    """
-    if "?" not in title and len(title) < 65:
-        return title + "?"
-    return title
+# ================= FALLBACK CTR TITLES =================
+def fallback_titles(base, vtype):
+    if vtype == "unboxing":
+        return [
+            f"{base} – Is It Really Worth It?",
+            f"I Tested {base} – Here’s What Happened",
+            f"{base} Review After Real Use",
+            f"{base} – Honest Review (No Hype)",
+            f"{base} – Pros & Cons Explained"
+        ]
 
+    if vtype == "gaming":
+        return [
+            f"{base} – This Went Wrong",
+            f"I Tried This in {base}…",
+            f"{base} – Unexpected Result",
+            f"{base} Gameplay That Shocked Me",
+            f"{base} – Worst vs Best Moment"
+        ]
+
+    if vtype == "music":
+        return [
+            f"{base} | English Lyrics",
+            f"{base} | Viral TikTok Version",
+            f"{base} – Emotional Version",
+            f"{base} Lyrics Everyone Is Searching For",
+            f"{base} | Most Played Song"
+        ]
+
+    return [
+        f"{base} – What Happened?",
+        f"{base} – Nobody Expected This",
+        f"{base} – Full Breakdown",
+        f"{base} – The Truth",
+        f"{base} – Explained"
+    ]
+
+# ================= MAIN TITLE GENERATOR =================
 def generate_top_titles(original_title):
-    base = clean_title(original_title)
+    base = clean(original_title)
+    vtype = detect_type(base)
+
     search_results = search_titles(base)
-
     results = []
-    for t in search_results:
-        t_clean = clean_title(t)
 
-        # juda o‘xshash bo‘lsa tashlab yuboramiz
-        if similarity(base, t_clean) > 0.85:
+    for t in search_results:
+        ct = clean(t)
+
+        if similarity(base, ct) > 0.92:
             continue
 
-        # juda uzun bo‘lsa kesamiz
-        if len(t_clean) > 75:
-            t_clean = t_clean[:72] + "..."
+        if len(ct) > 75:
+            ct = ct[:72] + "..."
 
-        t_clean = ctr_boost(t_clean)
-
-        # yana bir xil chiqmasligi uchun
-        if all(similarity(t_clean, r) < 0.8 for r in results):
-            results.append(t_clean)
+        if all(similarity(ct, r) < 0.8 for r in results):
+            results.append(ct)
 
         if len(results) >= 5:
             break
+
+    # FALLBACK
+    if len(results) < 3:
+        results = fallback_titles(base, vtype)
 
     return results
 
@@ -92,10 +138,9 @@ async def start(msg: Message):
     await msg.answer(
         "👋 <b>Salom!</b>\n\n"
         "YouTube video havolasini yuboring.\n\n"
-        "Men sizga:\n"
-        "🧠 TOP NOMLAR (YouTube Search asosida)\n"
-        "🏷 TOP TAGLAR\n"
-        "chiqarib beraman."
+        "🧠 TOP NOMLAR — YouTube search + analiz\n"
+        "🏷 CTR oshiruvchi nomlar\n"
+        "❌ Qotmaydi, ❌ topilmadi chiqmaydi"
     )
 
 @dp.message(F.text.startswith("http"))
@@ -106,7 +151,7 @@ async def handle_video(msg: Message):
         return
 
     try:
-        data = yt("videos", {"part": "snippet,statistics", "id": vid})["items"][0]
+        data = yt("videos", {"part": "snippet", "id": vid})["items"][0]
     except:
         await msg.answer("❌ Video topilmadi yoki API cheklangan.")
         return
@@ -126,7 +171,7 @@ async def handle_video(msg: Message):
 
     await msg.answer(
         f"🎬 <b>{title}</b>\n\n"
-        "👇 TOP NOMLARNI olish uchun tugmani bosing:",
+        "👇 TOP NOMLARNI olish uchun bosing:",
         reply_markup=kb
     )
 
@@ -136,15 +181,9 @@ async def cb_title(cb: CallbackQuery):
     vid = cb.data.split(":")[1]
     data = yt("videos", {"part": "snippet", "id": vid})["items"][0]
 
-    original_title = data["snippet"]["title"]
-    titles = generate_top_titles(original_title)
+    titles = generate_top_titles(data["snippet"]["title"])
 
-    if not titles:
-        await cb.message.answer("⚠️ Yetarli o‘xshash nomlar topilmadi.")
-        await cb.answer()
-        return
-
-    text = "🧠 <b>YouTube Search asosida TOP NOMLAR:</b>\n\n"
+    text = "🧠 <b>ANALIZ ASOSIDA TOP NOMLAR:</b>\n\n"
     for i, t in enumerate(titles, 1):
         text += f"{i}. {t}\n"
 
