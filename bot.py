@@ -1,11 +1,10 @@
 import os, re, sqlite3, asyncio, time, json
 from datetime import datetime, timedelta, timezone
-
 import requests
+
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
-    Message, InlineKeyboardMarkup, InlineKeyboardButton,
-    CallbackQuery
+    Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 )
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart
@@ -13,23 +12,15 @@ from aiogram.client.default import DefaultBotProperties
 
 # ================= CONFIG =================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-API_KEYS = os.getenv("YOUTUBE_API_KEYS", "").split(",")
+API_KEYS = [k.strip() for k in os.getenv("YOUTUBE_API_KEYS","").split(",") if k.strip()]
+
+TZ_TASHKENT = timezone(timedelta(hours=5))
 
 bot = Bot(
     token=BOT_TOKEN,
     default=DefaultBotProperties(parse_mode=ParseMode.HTML)
 )
 dp = Dispatcher()
-
-TZ_TASHKENT = timezone(timedelta(hours=5))
-
-# ================= CATEGORY MAP =================
-CATEGORY_MAP = {
-    "20": ("Gaming", "Игры", "O‘yinlar"),
-    "24": ("Entertainment", "Развлечения", "Ko‘ngilochar"),
-    "22": ("People & Blogs", "Люди и блоги", "Bloglar"),
-    "10": ("Music", "Музыка", "Musiqa"),
-}
 
 # ================= DB + RAM =================
 db = sqlite3.connect("cache.db", check_same_thread=False)
@@ -44,16 +35,16 @@ CREATE TABLE IF NOT EXISTS cache (
 db.commit()
 
 RAM = {}
-CACHE_TTL = 3600
+CACHE_TTL = 24 * 3600  # 24 soat (kategoriya kam o‘zgaradi)
 
 def cache_get(key):
     if key in RAM:
         return RAM[key]
     cur.execute("SELECT data, ts FROM cache WHERE key=?", (key,))
-    r = cur.fetchone()
-    if not r or time.time() - r[1] > CACHE_TTL:
+    row = cur.fetchone()
+    if not row or time.time() - row[1] > CACHE_TTL:
         return None
-    data = json.loads(r[0])
+    data = json.loads(row[0])
     RAM[key] = data
     return data
 
@@ -65,8 +56,9 @@ def cache_set(key, data):
     )
     db.commit()
 
-# ================= YT HELPERS =================
+# ================= YT REQUEST =================
 def yt(endpoint, params):
+    last_err = None
     for k in API_KEYS:
         try:
             params["key"] = k
@@ -77,19 +69,20 @@ def yt(endpoint, params):
             )
             if r.status_code == 200:
                 return r.json()
-        except:
-            pass
-    raise Exception("YouTube API error")
+            last_err = r.text
+        except Exception as e:
+            last_err = str(e)
+    raise Exception(f"YouTube API error: {last_err}")
 
+# ================= HELPERS =================
 def extract_video_id(url):
     m = re.search(r"(v=|be/)([\w\-]{11})", url)
     return m.group(2) if m else None
 
 def tashkent_time(iso):
-    dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    dt = datetime.fromisoformat(iso.replace("Z","+00:00"))
     return dt.astimezone(TZ_TASHKENT).strftime("%d.%m.%Y %H:%M")
 
-# ================= NAKRUTKA =================
 def like_nakrutka(views, likes):
     if views == 0:
         return "⚪ Maʼlumot yetarli emas"
@@ -99,6 +92,45 @@ def like_nakrutka(views, likes):
     if r > 0.15:
         return "🟡 Shubhali"
     return "🟢 Normal"
+
+# ================= CATEGORY AUTO LOAD =================
+CATEGORY_TRANSLATE = {
+    "Film & Animation": ("Film & Animation", "Фильмы и анимация", "Film va animatsiya"),
+    "Autos & Vehicles": ("Autos & Vehicles", "Авто и транспорт", "Avto va transport"),
+    "Music": ("Music", "Музыка", "Musiqa"),
+    "Pets & Animals": ("Pets & Animals", "Животные", "Hayvonlar"),
+    "Sports": ("Sports", "Спорт", "Sport"),
+    "Travel & Events": ("Travel & Events", "Путешествия", "Sayohat"),
+    "Gaming": ("Gaming", "Игры", "O‘yinlar"),
+    "People & Blogs": ("People & Blogs", "Люди и блоги", "Bloglar"),
+    "Comedy": ("Comedy", "Юмор", "Qiziqarli"),
+    "Entertainment": ("Entertainment", "Развлечения", "Ko‘ngilochar"),
+    "News & Politics": ("News & Politics", "Новости", "Yangiliklar"),
+    "Howto & Style": ("Howto & Style", "Стиль", "Qanday qilish"),
+    "Education": ("Education", "Образование", "Ta’lim"),
+    "Science & Technology": ("Science & Technology", "Наука", "Fan va texnologiya"),
+    "Nonprofits & Activism": ("Nonprofits & Activism", "НКО", "Ijtimoiy")
+}
+
+def load_categories():
+    cached = cache_get("categories")
+    if cached:
+        return cached
+
+    js = yt("videoCategories", {
+        "part": "snippet",
+        "regionCode": "US"
+    })
+
+    cats = {}
+    for it in js["items"]:
+        title = it["snippet"]["title"]
+        cats[it["id"]] = CATEGORY_TRANSLATE.get(
+            title, (title, title, title)
+        )
+
+    cache_set("categories", cats)
+    return cats
 
 # ================= VIDEO =================
 def get_video(video_id):
@@ -111,20 +143,22 @@ def get_video(video_id):
         "part": "snippet,statistics",
         "id": video_id
     })
+
     it = js["items"][0]
+    categories = load_categories()
 
     cat_id = it["snippet"].get("categoryId")
-    cat = CATEGORY_MAP.get(cat_id, ("—", "—", "—"))
+    cat = categories.get(cat_id, ("—", "—", "—"))
 
     data = {
         "id": video_id,
         "title": it["snippet"]["title"],
-        "desc": it["snippet"].get("description", ""),
+        "desc": it["snippet"].get("description",""),
         "thumb": it["snippet"]["thumbnails"]["high"]["url"],
         "published": tashkent_time(it["snippet"]["publishedAt"]),
-        "views": int(it["statistics"].get("viewCount", 0)),
-        "likes": int(it["statistics"].get("likeCount", 0)),
-        "comments": int(it["statistics"].get("commentCount", 0)),
+        "views": int(it["statistics"].get("viewCount",0)),
+        "likes": int(it["statistics"].get("likeCount",0)),
+        "comments": int(it["statistics"].get("commentCount",0)),
         "channel": it["snippet"]["channelTitle"],
         "category": cat
     }
@@ -132,12 +166,12 @@ def get_video(video_id):
     cache_set(key, data)
     return data
 
-# ================= SEARCH =================
-def search_top_videos(query, days=30, limit=25):
+# ================= SEARCH TOP 10 =================
+def search_top_videos(query, days=30, limit=10):
     key = f"search:{query}:{days}"
     cached = cache_get(key)
     if cached:
-        return cached
+        return cached[:limit]
 
     after = (datetime.utcnow() - timedelta(days=days)).isoformat() + "Z"
 
@@ -163,7 +197,8 @@ def search_top_videos(query, days=30, limit=25):
     for v in stats["items"]:
         out.append({
             "title": v["snippet"]["title"],
-            "views": int(v["statistics"].get("viewCount", 0))
+            "views": int(v["statistics"].get("viewCount",0)),
+            "url": f"https://youtu.be/{v['id']}"
         })
 
     cache_set(key, out)
@@ -199,7 +234,6 @@ async def handle(m: Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🧠 TOP KONKURENT NOMLAR", callback_data=f"title:{vid}")],
         [InlineKeyboardButton(text="🏷 TAG / TAVSIF", callback_data=f"tags:{vid}")],
-        [InlineKeyboardButton(text="📺 RAQOBATCHI KANALLAR", callback_data=f"chan:{vid}")]
     ])
 
     await msg.edit_text(text, reply_markup=kb)
@@ -210,10 +244,10 @@ async def cb_titles(c: CallbackQuery):
     vid = c.data.split(":")[1]
     data = get_video(vid)
 
-    res = await asyncio.to_thread(search_top_videos, data["title"], 30, 25)
+    res = await asyncio.to_thread(search_top_videos, data["title"], 30, 10)
 
     lines = [
-        f"{i+1}. {r['title']}\n👁 {r['views']:,}"
+        f"{i+1}. {r['title']}\n👁 {r['views']:,}\n🔗 {r['url']}"
         for i, r in enumerate(res)
     ]
 
@@ -232,33 +266,6 @@ async def cb_tags(c: CallbackQuery):
         "<b>🏷 Video taglari</b>\n<pre>" + ", ".join(words[:25]) + "</pre>\n\n"
         "<b>🏷 Kanal taglari</b>\n<pre>" + ", ".join(words[:15]) + "</pre>\n\n"
         "<b>📝 Description</b>\n<pre>" + d["desc"][:800] + "</pre>"
-    )
-
-@dp.callback_query(F.data.startswith("chan:"))
-async def cb_channels(c: CallbackQuery):
-    vid = c.data.split(":")[1]
-    d = get_video(vid)
-
-    js = yt("search", {
-        "part": "snippet",
-        "q": d["title"],
-        "type": "video",
-        "maxResults": 15
-    })
-
-    channel_ids = list({i["snippet"]["channelId"] for i in js["items"]})
-
-    ch_js = yt("channels", {
-        "part": "snippet",
-        "id": ",".join(channel_ids)
-    })
-
-    names = [i["snippet"]["title"] for i in ch_js["items"]]
-
-    out = [f"{i+1}. {name}" for i, name in enumerate(names[:10])]
-
-    await c.message.answer(
-        "<b>📺 RAQOBATCHI KANALLAR (TOP)</b>\n\n" + "\n".join(out)
     )
 
 # ================= RUN =================
