@@ -3,7 +3,6 @@ import re
 import sqlite3
 import time
 import os
-import csv
 import requests
 from datetime import datetime, timedelta, timezone
 
@@ -217,7 +216,7 @@ async def start(m: Message):
 
 
 @dp.message(Command("export"))
-async def export_data(m: Message):
+async def export_txt(m: Message):
     if not is_admin(m.from_user.id):
         await m.answer("❌ Bu buyruq faqat admin uchun.")
         return
@@ -233,20 +232,17 @@ async def export_data(m: Message):
         await m.answer("ℹ️ Hozircha hech qanday link yo‘q.")
         return
 
-    filename = "submissions_export.csv"
-    with open(filename, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            "user_id", "username", "video_url", "video_id", "created_at"
-        ])
+    filename = "submissions_export.txt"
+    with open(filename, "w", encoding="utf-8") as f:
         for r in rows:
-            writer.writerow([
-                r[0],
-                r[1] or "",
-                r[2],
-                r[3],
-                datetime.fromtimestamp(r[4]).strftime("%Y-%m-%d %H:%M:%S")
-            ])
+            ts = datetime.fromtimestamp(r[4]).strftime("%Y-%m-%d %H:%M:%S")
+            f.write(
+                f"📅 {ts}\n"
+                f"👤 @{r[1] or 'no_username'} ({r[0]})\n"
+                f"🔗 {r[2]}\n"
+                f"🆔 {r[3]}\n"
+                "------------------------------\n\n"
+            )
 
     await m.answer_document(FSInputFile(filename))
 # =====================================
@@ -341,7 +337,6 @@ async def top_videos(c: CallbackQuery):
         (vid,)
     ).fetchone()[0]
 
-    # 1️⃣ search.list
     search_data = yt_api("search", {
         "part": "snippet",
         "type": "video",
@@ -353,7 +348,6 @@ async def top_videos(c: CallbackQuery):
 
     video_ids = [it["id"]["videoId"] for it in search_data.get("items", [])[:10]]
 
-    # 2️⃣ videos.list (statistics)
     stats_data = yt_api("videos", {
         "part": "statistics",
         "id": ",".join(video_ids)
@@ -367,11 +361,11 @@ async def top_videos(c: CallbackQuery):
     text = "🧠 TOP 10 KONKURENT VIDEO:\n\n"
     for i, it in enumerate(search_data.get("items", [])[:10], 1):
         v_id = it["id"]["videoId"]
-        title_v = it["snippet"]["title"]
-        views_v = views_map.get(v_id, 0)
+        v_title = it["snippet"]["title"]
+        v_views = views_map.get(v_id, 0)
         text += (
-            f"{i}. {title_v}\n"
-            f"👁 {views_v:,}\n"
+            f"{i}. {v_title}\n"
+            f"👁 {v_views:,}\n"
             f"https://youtu.be/{v_id}\n\n"
         )
 
@@ -429,7 +423,7 @@ async def tags(c: CallbackQuery):
 # ================= MAIN ================
 async def main():
     dp.include_router(router)
-    print("🤖 BOT ISHLAYAPTI — TOP 10 VIEWCOUNT QO‘SHILDI")
+    print("🤖 BOT ISHLAYAPTI — /export TXT ONLY")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
