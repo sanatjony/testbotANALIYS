@@ -1,15 +1,12 @@
 import os, re, asyncio, requests
-from collections import Counter
+from difflib import SequenceMatcher
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import (
-    Message, InlineKeyboardMarkup,
-    InlineKeyboardButton, CallbackQuery
-)
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 
-# ================== CONFIG ==================
+# ================= CONFIG =================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 
@@ -19,7 +16,7 @@ bot = Bot(
 )
 dp = Dispatcher()
 
-# ================== YOUTUBE API ==================
+# ================= YOUTUBE API =================
 def yt(endpoint, params):
     params["key"] = YOUTUBE_API_KEY
     r = requests.get(
@@ -37,63 +34,67 @@ def extract_video_id(url):
             return m.group(1)
     return None
 
-def words(text):
-    return re.findall(r"[a-zA-Z]{3,}", text.lower())
+# ================= TEXT UTILS =================
+def similarity(a, b):
+    return SequenceMatcher(None, a.lower(), b.lower()).ratio()
 
-# ================== REAL SEARCH ANALYSIS ==================
+def clean_title(t):
+    return re.sub(r"[^\w\s]", "", t).strip()
+
+# ================= SEARCH & TITLE ANALYSIS =================
 def search_titles(keyword):
     data = yt("search", {
         "part": "snippet",
         "q": keyword,
         "type": "video",
-        "maxResults": 20
+        "maxResults": 30
     })
     return [v["snippet"]["title"] for v in data.get("items", [])]
 
-def extract_hooks(titles):
-    hooks = []
-    for t in titles:
-        hooks += words(t)
-    common = Counter(hooks).most_common(15)
-    return [w for w, _ in common]
+def ctr_boost(title):
+    """
+    CTR oshirish uchun kichik optimizatsiya
+    """
+    if "?" not in title and len(title) < 65:
+        return title + "?"
+    return title
 
-# ================== SMART TITLE GENERATOR ==================
-def generate_titles_from_search(original_title):
-    search_results = search_titles(original_title)
-    hooks = extract_hooks(search_results)
+def generate_top_titles(original_title):
+    base = clean_title(original_title)
+    search_results = search_titles(base)
 
-    base = original_title.split("|")[0].strip()
+    results = []
+    for t in search_results:
+        t_clean = clean_title(t)
 
-    templates = [
-        "I Tried {base} – {hook} Happened",
-        "{base} – Nobody Expected This",
-        "This {base} Was a Mistake",
-        "{base} – You Won’t Believe What Happened",
-        "What Happens When {base} Goes Wrong?"
-    ]
+        # juda o‘xshash bo‘lsa tashlab yuboramiz
+        if similarity(base, t_clean) > 0.85:
+            continue
 
-    titles = []
-    for i, tpl in enumerate(templates):
-        hook = hooks[i % len(hooks)] if hooks else "Something Crazy"
-        titles.append(tpl.format(base=base, hook=hook.capitalize()))
+        # juda uzun bo‘lsa kesamiz
+        if len(t_clean) > 75:
+            t_clean = t_clean[:72] + "..."
 
-    return titles
+        t_clean = ctr_boost(t_clean)
 
-# ================== TAGS ==================
-def generate_tags(title, hooks):
-    tags = list(dict.fromkeys(words(title) + hooks))
-    return ", ".join(tags[:30])
+        # yana bir xil chiqmasligi uchun
+        if all(similarity(t_clean, r) < 0.8 for r in results):
+            results.append(t_clean)
 
-# ================== HANDLERS ==================
+        if len(results) >= 5:
+            break
+
+    return results
+
+# ================= HANDLERS =================
 @dp.message(F.text == "/start")
 async def start(msg: Message):
     await msg.answer(
         "👋 <b>Salom!</b>\n\n"
-        "YouTube video linkini yuboring.\n\n"
+        "YouTube video havolasini yuboring.\n\n"
         "Men sizga:\n"
-        "🧠 TOP NOMLAR (real search asosida)\n"
+        "🧠 TOP NOMLAR (YouTube Search asosida)\n"
         "🏷 TOP TAGLAR\n"
-        "📊 Raqobatchi kanallar\n"
         "chiqarib beraman."
     )
 
@@ -118,10 +119,6 @@ async def handle_video(msg: Message):
                 InlineKeyboardButton(
                     text="🧠 TOP NOMLAR",
                     callback_data=f"title:{vid}"
-                ),
-                InlineKeyboardButton(
-                    text="🏷 TOP TAGLAR",
-                    callback_data=f"tags:{vid}"
                 )
             ]
         ]
@@ -129,44 +126,32 @@ async def handle_video(msg: Message):
 
     await msg.answer(
         f"🎬 <b>{title}</b>\n\n"
-        "👇 Kerakli funksiyani tanlang:",
+        "👇 TOP NOMLARNI olish uchun tugmani bosing:",
         reply_markup=kb
     )
 
-# ================== CALLBACKS ==================
+# ================= CALLBACK =================
 @dp.callback_query(F.data.startswith("title:"))
 async def cb_title(cb: CallbackQuery):
     vid = cb.data.split(":")[1]
     data = yt("videos", {"part": "snippet", "id": vid})["items"][0]
 
-    title = data["snippet"]["title"]
-    titles = generate_titles_from_search(title)
+    original_title = data["snippet"]["title"]
+    titles = generate_top_titles(original_title)
 
-    text = "🧠 <b>ANALIZ ASOSIDA TOP NOMLAR:</b>\n\n"
+    if not titles:
+        await cb.message.answer("⚠️ Yetarli o‘xshash nomlar topilmadi.")
+        await cb.answer()
+        return
+
+    text = "🧠 <b>YouTube Search asosida TOP NOMLAR:</b>\n\n"
     for i, t in enumerate(titles, 1):
         text += f"{i}. {t}\n"
 
     await cb.message.answer(text)
     await cb.answer()
 
-@dp.callback_query(F.data.startswith("tags:"))
-async def cb_tags(cb: CallbackQuery):
-    vid = cb.data.split(":")[1]
-    data = yt("videos", {"part": "snippet", "id": vid})["items"][0]
-
-    title = data["snippet"]["title"]
-    search = search_titles(title)
-    hooks = extract_hooks(search)
-
-    tags = generate_tags(title, hooks)
-
-    await cb.message.answer(
-        "🏷 <b>TOP TAGLAR (copy–paste):</b>\n\n"
-        f"<code>{tags}</code>"
-    )
-    await cb.answer()
-
-# ================== RUN ==================
+# ================= RUN =================
 async def main():
     print("🤖 TEST BOT ishga tushdi")
     await dp.start_polling(bot)
