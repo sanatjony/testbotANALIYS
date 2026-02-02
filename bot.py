@@ -3,13 +3,9 @@ import re
 import asyncio
 import requests
 from datetime import datetime
-from io import BytesIO
 from collections import Counter
 
 import pytz
-import matplotlib.pyplot as plt
-from pytrends.request import TrendReq
-
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -27,43 +23,25 @@ TZ = pytz.timezone("Asia/Tashkent")
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
-# ================= CACHE =================
-TREND_CACHE = {}
-CACHE_TTL = 1800  # 30 min
-
 # ================= FILTERS =================
 KIDS_WORDS = {
-    "kids", "kid", "children", "child", "toy", "toys", "cartoon",
-    "nursery", "baby", "toddler", "learn colors"
+    "kids", "kid", "children", "toy", "toys", "cartoon", "baby", "nursery"
 }
 
 BANNED_WORDS = {
     "free", "download", "hack", "cheat", "crack", "mod apk"
 }
 
+TRIGGER_WORDS = [
+    "vs", "challenge", "crash test", "experiment", "gameplay",
+    "realistic", "physics", "simulation", "insane", "extreme"
+]
+
 # ================= HELPERS =================
 def get_video_id(url: str):
     m = re.search(r"(v=|youtu\.be/|/live/)([^&?/]+)", url)
     return m.group(2) if m else None
 
-def extract_keyword(title: str):
-    words = title.split()
-    return " ".join(words[:3]) if len(words) >= 3 else title
-
-def clean_words(words):
-    result = []
-    for w in words:
-        lw = w.lower()
-        if lw in KIDS_WORDS:
-            continue
-        if lw in BANNED_WORDS:
-            continue
-        if len(w) < 4:
-            continue
-        result.append(w)
-    return result
-
-# ================= YOUTUBE API =================
 def yt_video(video_id: str):
     url = (
         "https://www.googleapis.com/youtube/v3/videos"
@@ -84,13 +62,32 @@ def yt_search(keyword: str, limit=30):
     )
     return requests.get(url, timeout=10).json().get("items", [])
 
+def clean_words(words):
+    out = []
+    for w in words:
+        lw = w.lower()
+        if lw in KIDS_WORDS or lw in BANNED_WORDS:
+            continue
+        if len(w) < 4:
+            continue
+        out.append(w)
+    return out
+
+def extract_phrases(title):
+    words = re.findall(r"[A-Za-z]{4,}", title)
+    words = clean_words(words)
+    phrases = []
+    for i in range(len(words) - 1):
+        phrases.append(f"{words[i]} {words[i+1]}")
+    return phrases
+
 # ================= START =================
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message):
     await message.answer(
         "👋 *YouTube Analyser TEST*\n\n"
         "📌 YouTube video link yuboring.\n"
-        "🏷 Trendga mos, xavfsiz taglar ham beriladi.",
+        "✍️ AI optimal video nomlarini tavsiya qiladi.",
         parse_mode="Markdown"
     )
 
@@ -98,86 +95,89 @@ async def start_cmd(message: types.Message):
 @dp.message()
 async def handle_video(message: types.Message):
     url = (message.text or "").strip()
-    video_id = get_video_id(url)
+    vid = get_video_id(url)
 
-    if not video_id:
+    if not vid:
         await message.answer("❌ YouTube link noto‘g‘ri.")
         return
 
-    video = yt_video(video_id)
+    video = yt_video(vid)
     if not video:
         await message.answer("❌ Video topilmadi.")
         return
 
-    sn = video["snippet"]
-    st = video["statistics"]
-
-    title = sn["title"]
-    channel = sn["channelTitle"]
-    published = datetime.fromisoformat(
-        sn["publishedAt"].replace("Z", "+00:00")
-    ).astimezone(TZ)
-
-    views = int(st.get("viewCount", 0))
-    likes = int(st.get("likeCount", 0))
-    comments = int(st.get("commentCount", 0))
-
-    keyword = extract_keyword(title)
+    title = video["snippet"]["title"]
+    channel = video["snippet"]["channelTitle"]
 
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🏷 Top Tags",
-                    callback_data=f"tags:{keyword}"
+                    text="✍️ Title AI",
+                    callback_data=f"titleai:{vid}"
                 )
             ]
         ]
     )
 
-    text = (
-        f"🎬 *{title}*\n"
+    await message.answer(
+        f"🎬 *Mavjud video nomi:*\n{title}\n\n"
         f"📺 Kanal: {channel}\n\n"
-        f"🕒 {published.strftime('%d.%m.%Y %H:%M')} (UTC+5)\n\n"
-        f"📊 *Statistika*\n"
-        f"👁 View: {views}\n"
-        f"👍 Like: {likes}\n"
-        f"💬 Comment: {comments}\n\n"
-        f"🔑 Mavzu: *{keyword}*"
+        f"✍️ Yangi, optimal nomlar olish uchun tugmani bosing.",
+        parse_mode="Markdown",
+        reply_markup=keyboard
     )
 
-    await message.answer(text, parse_mode="Markdown", reply_markup=keyboard)
+# ================= AI TITLE =================
+@dp.callback_query(F.data.startswith("titleai:"))
+async def title_ai_cb(call: types.CallbackQuery):
+    video_id = call.data.split("titleai:", 1)[1]
+    video = yt_video(video_id)
 
-# ================= TOP TAGS =================
-@dp.callback_query(F.data.startswith("tags:"))
-async def tags_cb(call: types.CallbackQuery):
-    keyword = call.data.split("tags:", 1)[1]
-    items = yt_search(keyword, limit=40)
-
-    words = []
-
-    for i in items:
-        title = i["snippet"]["title"]
-        found = re.findall(r"[A-Za-z]{4,}", title)
-        words.extend(clean_words(found))
-
-    if not words:
-        await call.message.answer("⚠️ Mos taglar topilmadi.")
+    if not video:
+        await call.message.answer("❌ Video topilmadi.")
         await call.answer()
         return
 
-    counter = Counter(words)
-    top_tags = [w for w, _ in counter.most_common(15)]
+    base_title = video["snippet"]["title"]
+    search_items = yt_search(base_title, limit=40)
 
-    text = "🏷 *Top trend & safe taglar*\n\n"
-    text += "```\n"
-    text += ", ".join(top_tags)
-    text += "\n```\n\n"
+    phrases = []
+    for item in search_items:
+        phrases.extend(extract_phrases(item["snippet"]["title"]))
+
+    if not phrases:
+        await call.message.answer("⚠️ Yetarli ma’lumot topilmadi.")
+        await call.answer()
+        return
+
+    phrase_counter = Counter(phrases)
+    core_phrases = [p for p, _ in phrase_counter.most_common(5)]
+
+    titles = []
+    for cp in core_phrases:
+        for trig in TRIGGER_WORDS:
+            t = f"{cp} {trig.title()} | {base_title.split('|')[0]}"
+            if 50 <= len(t) <= 75:
+                titles.append(t)
+            if len(titles) >= 5:
+                break
+        if len(titles) >= 5:
+            break
+
+    if not titles:
+        titles = [f"{cp} Gameplay | {base_title}" for cp in core_phrases[:5]]
+
+    text = "✍️ *AI tavsiya qilgan optimal video nomlari*\n\n"
+    for i, t in enumerate(titles, 1):
+        text += f"{i}. {t}\n\n"
+
     text += (
-        "✅ NoKids\n"
-        "✅ YouTube qoidalariga mos\n"
-        "📈 Trendga yaqin\n\n"
-        "📌 *Tavsiya:* video va kanal taglariga qo‘shing."
+        "📌 *Izoh:*\n"
+        "• SEO + trendga mos\n"
+        "• Optimal uzunlik (55–70)\n"
+        "• NoKids, qoidaga mos\n"
+        "• CTR oshirishga yo‘naltirilgan"
     )
 
     await call.message.answer(text, parse_mode="Markdown")
@@ -185,7 +185,7 @@ async def tags_cb(call: types.CallbackQuery):
 
 # ================= RUN =================
 async def main():
-    print("TEST bot ishga tushdi (Top Tags)")
+    print("TEST bot ishga tushdi (AI Title Generator)")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
