@@ -7,7 +7,7 @@ from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, C
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 
-# ================== CONFIG ==================
+# ================= CONFIG =================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 
@@ -17,13 +17,13 @@ bot = Bot(
 )
 dp = Dispatcher()
 
-# ================== YOUTUBE API ==================
+# ================= YOUTUBE API =================
 def yt(endpoint, params):
     params["key"] = YOUTUBE_API_KEY
     r = requests.get(
         f"https://www.googleapis.com/youtube/v3/{endpoint}",
         params=params,
-        timeout=10
+        timeout=12
     )
     r.raise_for_status()
     return r.json()
@@ -35,71 +35,87 @@ def extract_video_id(url):
             return m.group(1)
     return None
 
-# ================== TEXT UTILS ==================
-def similarity(a, b):
-    return SequenceMatcher(None, a.lower(), b.lower()).ratio()
-
+# ================= HELPERS =================
 def clean(text):
     return re.sub(r"[^\w\s]", "", text).strip()
 
-# ================== DATE ==================
-def is_last_30_days(published):
-    published_date = datetime.strptime(published, "%Y-%m-%dT%H:%M:%SZ")
-    return published_date >= datetime.utcnow() - timedelta(days=30)
+def similarity(a, b):
+    return SequenceMatcher(None, a.lower(), b.lower()).ratio()
 
-# ================== MAIN LOGIC ==================
-def get_competitor_top_titles(keyword):
-    search = yt("search", {
-        "part": "snippet",
-        "q": keyword,
-        "type": "video",
-        "order": "viewCount",
-        "maxResults": 50
-    })
+def last_30_days(date_str):
+    d = datetime.strptime(date_str, "%Y-%m-%dT%H:%M:%SZ")
+    return d >= datetime.utcnow() - timedelta(days=30)
 
-    titles = []
+# ================= CORE ANALYSIS =================
+def competitor_top_titles(base_title):
+    base_clean = clean(base_title)
+    words = base_clean.split()
 
-    for item in search.get("items", []):
-        vid = item["id"]["videoId"]
-        snippet = item["snippet"]
+    # 3 xil search query
+    queries = [
+        base_clean,
+        " ".join(words[:4]),
+        " ".join(words[:2]) + " review"
+    ]
 
-        if not is_last_30_days(snippet["publishedAt"]):
-            continue
+    results = []
 
-        video_data = yt("videos", {
-            "part": "statistics,snippet",
-            "id": vid
-        })["items"]
+    for q in queries:
+        search = yt("search", {
+            "part": "snippet",
+            "q": q,
+            "type": "video",
+            "order": "viewCount",
+            "maxResults": 25
+        })
 
-        if not video_data:
-            continue
+        for item in search.get("items", []):
+            vid = item["id"]["videoId"]
+            snip = item["snippet"]
 
-        views = int(video_data[0]["statistics"].get("viewCount", 0))
-        if views < 1000:
-            continue
+            if not last_30_days(snip["publishedAt"]):
+                continue
 
-        title = clean(video_data[0]["snippet"]["title"])
+            video = yt("videos", {
+                "part": "statistics,snippet",
+                "id": vid
+            })["items"]
 
-        # DUPLICATE CHECK
-        if any(similarity(title, t) > 0.9 for t in titles):
-            continue
+            if not video:
+                continue
 
-        titles.append(title)
+            stats = video[0]["statistics"]
+            views = int(stats.get("viewCount", 0))
 
-        if len(titles) >= 10:
-            break
+            if views < 500:
+                continue
 
-    return titles
+            title = clean(video[0]["snippet"]["title"])
 
-# ================== HANDLERS ==================
+            if any(similarity(title, r["title"]) > 0.85 for r in results):
+                continue
+
+            results.append({
+                "title": title,
+                "views": views
+            })
+
+            if len(results) >= 15:
+                return sorted(results, key=lambda x: x["views"], reverse=True)
+
+    return sorted(results, key=lambda x: x["views"], reverse=True)
+
+# ================= HANDLERS =================
 @dp.message(F.text == "/start")
 async def start(msg: Message):
     await msg.answer(
         "👋 <b>Salom!</b>\n\n"
-        "YouTube video havolasini yuboring.\n\n"
-        "🧠 TOP NOMLAR — konkurent kanallar analizi\n"
-        "📊 Oxirgi 30 kun + eng ko‘p ko‘rilgan\n"
-        "❌ Random emas, REAL"
+        "YouTube video linkini yuboring.\n\n"
+        "🧠 Konkurentlar asosida:\n"
+        "• TOP NOMLAR\n"
+        "• Oxirgi 30 kun\n"
+        "• Ko‘rishlar soni bilan\n"
+        "• CTR’ga mos"
     )
 
 @dp.message(F.text.startswith("http"))
@@ -134,29 +150,28 @@ async def handle_video(msg: Message):
         reply_markup=kb
     )
 
-# ================== CALLBACK ==================
 @dp.callback_query(F.data.startswith("top:"))
 async def cb_top(cb: CallbackQuery):
     vid = cb.data.split(":")[1]
 
     data = yt("videos", {"part": "snippet", "id": vid})["items"][0]
-    base_title = clean(data["snippet"]["title"])
+    base_title = data["snippet"]["title"]
 
-    titles = get_competitor_top_titles(base_title)
+    tops = competitor_top_titles(base_title)
 
-    if not titles:
+    if not tops:
         await cb.message.answer("⚠️ Konkurentlardan yetarli ma’lumot topilmadi.")
         await cb.answer()
         return
 
     text = "🧠 <b>OXIRGI 30 KUN — KONKURENTLAR TOP NOMLARI:</b>\n\n"
-    for i, t in enumerate(titles, 1):
-        text += f"{i}. {t}\n"
+    for i, t in enumerate(tops, 1):
+        text += f"{i}. {t['title']} — 👁 {t['views']:,}\n"
 
     await cb.message.answer(text)
     await cb.answer()
 
-# ================== RUN ==================
+# ================= RUN =================
 async def main():
     print("🤖 TEST BOT ishga tushdi")
     await dp.start_polling(bot)
