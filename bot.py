@@ -27,9 +27,8 @@ YOUTUBE_API_KEY = YOUTUBE_API_KEY.strip()
 
 # ================= CONFIG ==============
 CREDIT_DAILY = 5
-
-TTL_VIDEO = 6 * 3600        # 6 soat
-TTL_SEARCH = 12 * 3600      # 12 soat
+TTL_VIDEO = 6 * 3600
+TTL_SEARCH = 12 * 3600
 # =====================================
 
 
@@ -105,20 +104,36 @@ def yt_api(endpoint, params):
     return r.json()
 
 
-def get_category_name(cat_id):
+def get_category_name(cat_id: str):
+    # 1️⃣ bo‘sh bo‘lsa — API chaqirmaymiz
+    if not cat_id:
+        return "Unknown"
+
+    # 2️⃣ DB cache
     cur.execute("SELECT name FROM categories WHERE category_id=?", (cat_id,))
     row = cur.fetchone()
     if row:
         return row[0]
 
-    data = yt_api("videoCategories", {
-        "part": "snippet",
-        "id": cat_id,
-        "regionCode": "US"
-    })
+    # 3️⃣ XAVFSIZ API chaqiruv
+    try:
+        data = yt_api("videoCategories", {
+            "part": "snippet",
+            "id": cat_id,
+            "regionCode": "US"
+        })
+        if data.get("items"):
+            name = data["items"][0]["snippet"]["title"]
+        else:
+            name = "Unknown"
+    except Exception:
+        name = "Unknown"
 
-    name = data["items"][0]["snippet"]["title"] if data["items"] else "Unknown"
-    cur.execute("INSERT OR IGNORE INTO categories VALUES (?,?)", (cat_id, name))
+    # 4️⃣ DB ga saqlaymiz (abadiy cache)
+    cur.execute(
+        "INSERT OR IGNORE INTO categories VALUES (?,?)",
+        (cat_id, name)
+    )
     conn.commit()
     return name
 
@@ -126,14 +141,12 @@ def get_category_name(cat_id):
 def detect_like_fraud(views, likes, comments, hours):
     if views == 0:
         return "⚪ Ma’lumot yetarli emas"
-
     if likes / views > 0.25 and views > 1000:
         return "🔴 LIKE NAKRUTKA EHTIMOLI"
     if comments / views < 0.001 and views > 5000:
         return "🟡 SHUBHALI FAOLLIGI"
     if hours < 2 and views > 10000:
         return "🟡 TEZ SUN’IY O‘SISH"
-
     return "🟢 NORMAL FAOLLIGI"
 # =====================================
 
@@ -145,7 +158,10 @@ def get_credit(uid):
     row = cur.fetchone()
 
     if not row:
-        cur.execute("INSERT INTO users VALUES (?,?,?)", (uid, CREDIT_DAILY, now))
+        cur.execute(
+            "INSERT INTO users VALUES (?,?,?)",
+            (uid, CREDIT_DAILY, now)
+        )
         conn.commit()
         return CREDIT_DAILY
 
@@ -215,9 +231,7 @@ async def analyze(m: Message):
     cur.execute("SELECT * FROM videos WHERE video_id=?", (vid,))
     row = cur.fetchone()
 
-    used_cache = False
-    if row and now - row[-1] < TTL_VIDEO:
-        used_cache = True
+    used_cache = bool(row and now - row[-1] < TTL_VIDEO)
 
     if not used_cache and credit <= 0:
         await m.answer("❌ Kredit tugagan", reply_markup=main_kb(credit))
@@ -232,7 +246,7 @@ async def analyze(m: Message):
         sn = item["snippet"]
         st = item["statistics"]
 
-        category = get_category_name(sn.get("categoryId", ""))
+        category = get_category_name(sn.get("categoryId"))
 
         cur.execute("""
         INSERT OR REPLACE INTO videos VALUES (?,?,?,?,?,?,?,?,?,?,?)
@@ -376,7 +390,7 @@ async def noop(c: CallbackQuery):
 
 
 async def main():
-    print("🤖 BOT ISHLAYAPTI (MAXIMAL TEJASH)")
+    print("🤖 BOT ISHLAYAPTI (FIXED, MAX TEJASH)")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
